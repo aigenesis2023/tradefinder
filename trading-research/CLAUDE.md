@@ -298,9 +298,13 @@ The engine surfaces signals; the human trades and manages P&L externally. Recomm
 1. **Profit target** (~+8% standard, ~+12% high-upside) → take profit
 2. **Stop loss** (~−6% from entry) → cut loss
 3. **Invalidation trigger** (specific event from Agent 3) → exit
-4. **Time stop at 10 trading days** → exit if nothing else fired
+4. **Time stop** → exit if nothing else fired:
+   - Standard signals: **10 trading days**
+   - Elite/HC signals (5+ insiders OR composite ≥ 3.5 + upside score ≥ 3.0): **20 trading days**
 
 Time stop is the catch-all; most trades resolve via 1, 2, or 3.
+
+**Horizon data:** 60 trading-day window shows +7.82% IWM-adj alpha (73% win rate, ex-COVID, n=78), showing strong setups keep running well past 10 days. The 10-day default optimises per-day alpha and capital efficiency. The 20-day extension for elite/HC setups captures the extended run without open-ended holding. 180d shows mean-reversion — do not hold indefinitely.
 
 ---
 

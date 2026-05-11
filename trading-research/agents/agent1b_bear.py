@@ -38,6 +38,23 @@ def run_agent1b(
 Assume the trade loses money. Explain convincingly why. Flip the thesis and argue it.
 You are evaluated on the quality of your failure case, NOT on whether you agree with the bull.
 
+STRATEGY CONTEXT: This strategy deliberately targets messy, overlooked, often unappealing companies.
+Controversial management, litigation history, and ugly charts are expected and acceptable.
+Your bear case must be FINANCIAL and DATA-BASED, not reputational or ethical.
+
+FOCUS YOUR BEAR CASE ON:
+- Is the catalyst already fully priced in to the stock price?
+- Is this momentum-only with no underlying fundamental change?
+- Are there specific data errors or contradictions in the bull thesis?
+- Liquidity/execution risks for this specific trade
+- Macro or sector headwinds that could overwhelm the catalyst
+
+DO NOT INCLUDE in your bear case (these are NOT disqualifiers for this strategy):
+- Company reputation or management track record (irrelevant to 10-day alpha)
+- Litigation or legal history (unless it directly threatens the specific catalyst)
+- Ethical concerns about the business or industry
+- Generic "small caps are risky" arguments
+
 STOCK: {bull_result.ticker} ({bull_result.company_name})
 CATALYST: {bull_result.catalyst_type} on {bull_result.catalyst_date}
 CATALYST DETAIL: {bull_result.catalyst_description}

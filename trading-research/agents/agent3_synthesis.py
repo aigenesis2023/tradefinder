@@ -78,6 +78,7 @@ class Agent3Result:
     high_upside_score: float = 0.0
     high_upside_markers: list = field(default_factory=list)
     regime_override: bool = False
+    recommended_hold_days: int = 10
     discard_reason: Optional[str] = None
 
 
@@ -196,6 +197,20 @@ def _deterministic_marginal_buyer_score(agent2: Agent2Result) -> float:
     return 2.5
 
 
+def _compute_recommended_hold(agent1: Agent1Result, composite: float, high_upside_score: float) -> int:
+    """
+    10 trading days is the default (best per-day alpha).
+    Extend to 20 for elite clusters or high-conviction + strong upside markers.
+    Data: 60 trading-day window shows +7.82% IWM-adj alpha (ex-COVID, n=78), 73% win rate —
+    the signal keeps running well beyond the initial 10-day pop for strong setups.
+    """
+    if agent1.unique_insiders >= 5:
+        return 20
+    if composite >= COMPOSITE_MIN and high_upside_score >= 3.0:
+        return 20
+    return 10
+
+
 def _compute_composite(catalyst_strength, catalyst_prior, quant, risk, info_asymmetry, data_quality, signal_bonus) -> float:
     raw = (
         (catalyst_strength * catalyst_prior * 0.30) +
@@ -311,6 +326,7 @@ def run_agent3(
         composite >= HIGH_UPSIDE_COMPOSITE_FLOOR
         and high_upside_score >= HIGH_UPSIDE_SCORE_MIN
     )
+    recommended_hold = _compute_recommended_hold(agent1, composite, high_upside_score)
 
     # Regime-override candidates carry elevated macro risk by construction —
     # cap confidence to keep position sizing honest. The surfacing decision
@@ -359,4 +375,5 @@ def run_agent3(
         high_upside_score=high_upside_score,
         high_upside_markers=high_upside_markers,
         regime_override=agent1.regime_override,
+        recommended_hold_days=recommended_hold,
     )

@@ -41,8 +41,26 @@ def run_agent1c(
     prompt = f"""You are Agent 1C (Supervisor). Identify whether the conflict between Bull and Bear is resolvable.
 You do NOT pick a winner.
 
-CRITICAL RULE: If any material disagreement is irresolvable with available data, output DISQUALIFIED.
-Uncertainty always favours disqualification. Never default to Bull.
+STRATEGY CONTEXT: This is a quantitative momentum strategy that deliberately targets overlooked, neglected,
+and often unappealing small/mid-cap stocks. Messy companies, controversial management, and litigious histories
+are EXPECTED — that is exactly where the information asymmetry and neglect alpha comes from.
+
+CRITICAL RULE: Disqualify ONLY on DATA or MATH conflicts. Specifically:
+- Mathematical errors in the bull thesis (numbers don't add up)
+- Factual contradictions that are irresolvable with available data (e.g. Bear proves catalyst date is wrong)
+- The catalyst has ALREADY been reported in mainstream financial media (priced in)
+- Data quality is so poor that no conclusion is possible
+
+DO NOT DISQUALIFY for any of the following — these are features, not bugs:
+- Company reputation or management controversy
+- Litigation history or pending lawsuits (unless they directly threaten the specific catalyst)
+- Controversial industry or ethical concerns
+- Overleveraged balance sheet (already factored into scoring via quant/risk components)
+- Bear case is "this might not work" without citing a specific irresolvable data conflict
+- Bear score is high but based on speculation rather than fact
+
+When in doubt about a DATA conflict: DISQUALIFIED.
+When the Bear's argument is qualitative risk/opinion rather than factual contradiction: PROCEED.
 
 STOCK: {bull.ticker} ({bull.company_name})
 
@@ -57,14 +75,14 @@ BEAR FLAGS: priced={bear.catalyst_already_priced} | momentum_only={bear.momentum
 CONTRACT MATERIALITY: {bear.contract_materiality_concern}
 NEGLECT VALIDITY: {bear.neglect_validity_concern}
 
-For each conflict: is it resolvable with available data, or fundamental uncertainty?
-If ANY material disagreement is irresolvable: DISQUALIFIED.
+For each conflict: is it a resolvable DATA disagreement, or a speculative risk opinion?
+Disqualify only on irresolvable data/math conflicts. Risk opinions → PROCEED.
 
 Return ONLY valid JSON:
 
 {{
   "outcome": "PROCEED" or "DISQUALIFIED",
-  "disqualify_reason": "<if DISQUALIFIED, the specific irresolvable conflict>",
+  "disqualify_reason": "<if DISQUALIFIED, the specific irresolvable DATA conflict — must cite data, not opinion>",
   "conflict_points": ["<conflict 1>", "<conflict 2>"],
   "resolution_summary": "<if PROCEED, how conflicts were resolved>",
   "conflict_level": "low" or "medium" or "high"

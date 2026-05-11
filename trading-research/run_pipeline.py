@@ -95,6 +95,9 @@ def _format_report(
             lines.append(f"   Contract value: {a3.catalyst_strength_score:.1f} catalyst strength")
         lines.append(f"   Confirming signals: {', '.join(a3.confirming_signals) if a3.confirming_signals else 'none'}")
         lines.append(f"   Signal bonus: +{a3.signal_bonus:.1f} | Data quality: {a3.data_quality_score:.1f}/5")
+        hold = getattr(a3, "recommended_hold_days", 10)
+        hold_note = " (extended — elite/HC setup)" if hold > 10 else ""
+        lines.append(f"   Hold target: {hold} trading days{hold_note}")
         if label_section == "high_upside" or a3.high_upside_score >= 2.5:
             markers = ', '.join(a3.high_upside_markers) if a3.high_upside_markers else 'none'
             lines.append(f"   Upside score: {a3.high_upside_score:.2f}/5 | Markers: {markers}")

@@ -9,6 +9,7 @@ A self-contained packet for an outside reviewer (Gemini, GPT, Grok, or human) to
 - Added a **High-Upside tier**: candidates with composite 3.0–3.5 plus strong asymmetric markers (short interest, deep conviction, step-change contracts) now appear in a separate report section.
 - Switched the expected holding horizon from 30 days to **10 days** based on per-day alpha analysis of the same backtest.
 - Removed all dead code (Agent 4, the N² LLM theme-clustering pass).
+- Tightened the insider-scanner lookback from 45 days to **21 days**. Empirical alpha lives within ~15 days of cluster_end; older signals were being decayed out anyway but were still consuming pipeline budget.
 
 Full rationale and tables below.
 

@@ -63,7 +63,12 @@ class Agent2Result:
 def _fetch_ohlcv(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-        return df if not df.empty else None
+        if df.empty:
+            return None
+        # yfinance ≥0.2.x returns MultiIndex columns (field, ticker) for single tickers too
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
     except Exception:
         return None
 

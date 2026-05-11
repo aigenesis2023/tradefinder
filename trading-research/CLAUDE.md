@@ -38,6 +38,12 @@ When the regime gate fails, the engine does NOT terminate. It runs in elite-only
 
 ---
 
+## DOMICILE
+
+No country filter. Form 4 is the bottleneck: only SEC-registered Section 16 filers reach the scanner, and the 7-year backtest cohort (n=383) included foreign-domiciled issuers that filed Form 4 (Australian/European names appear in `backtest/cache/form4_xml/`). Removing the prior hard `country == US` filter (removed v3.1, 2026-05-11) realigns the live engine with the validated cohort. Foreign-domiciled US-listed names (e.g. SRAD on NASDAQ) flow through normally; real risks (thin ADV, primary-exchange-in-other-timezone gap noise) are caught by `liquidity_warning` and `data_quality_score` flags, not by domicile.
+
+---
+
 ## MARKET CAP FILTER
 
 | Range | Treatment |
@@ -119,7 +125,11 @@ information_asymmetry_score =
     (coverage_gap            * 0.40) +
     (narrative_inconsistency * 0.30)
 ```
-Coverage gap scale: ≤3 analysts = 5, 4–5 = 4, 6–8 = 3, >8 = below 3.
+Coverage gap scale: ≤3 analysts = 5, 4–5 = 4, 6–8 = 3, >8 = `max(2.0, 3.0 − (analyst_count − 8) × 0.3)`.
+
+**Floor at 2.0** (v3.1, 2026-05-11): without a floor the >8-analyst decay zeroes out coverage_gap entirely at ~18 analysts and mathematically caps info_asymmetry at 3.0 max, making the HC 3.5 threshold unreachable for any well-covered name. The backtest cohort had no info_asymmetry filter at all; flooring at 2.0 still penalises coverage but does not unconditionally exclude.
+
+**Drawdown boost** (v3.1, 2026-05-11): if `price / fiftyTwoWeekHigh < 0.70`, add +1.0 to coverage_score (capped at 5.0). Heavy coverage with the stock deep in drawdown is a sentiment-dislocation pattern (bullish analyst targets + bearish tape + insider buying), not "priced-in." This is a deliberate departure from a pure analyst-count proxy and worth shadow-validating during paper trading.
 
 | Score | Treatment |
 |---|---|
@@ -204,7 +214,19 @@ High Conviction definition: composite ≥ 3.5 AND asymmetry ≥ 3.5 AND neglect 
 |---|---|---|
 | 1 (Bull) | Discovery + thesis | Yes (narrative only) |
 | 1B (Bear) | Pre-mortem failure case | Yes |
-| 1C (Supervisor) | Identifies irresolvable **data/math** conflict — disqualifies on uncertainty, never defaults to Bull. Does NOT disqualify on reputation, litigation, controversy, or ethics. | Yes |
+| 1C (Supervisor) | Disqualifies ONLY on a closed list of data/math errors (D1–D5). Defaults to PROCEED. Does NOT disqualify on reputation, litigation, short interest, governance, macro, or qualitative risk — those are priced via the scoring layer. | Yes |
+
+### Agent 1C — closed disqualification list (v3.1, 2026-05-11)
+
+Earlier prompt used "when in doubt → disqualify," which the LLM generalised to any conflict. Result: 96% disqualification rate over a 4-day audit (27/28 candidates killed, including short-interest signals that are supposed to be POSITIVE per CLAUDE.md). Replaced with a closed list. Disqualification requires the `disqualify_reason` to start with one of:
+
+- **D1**: Specific numerical/factual error in Bull thesis (Bear cites the wrong number)
+- **D2**: Catalyst date or existence proven wrong
+- **D3**: Catalyst already reported by mainstream financial media (WSJ/Bloomberg/Reuters/FT) BEFORE catalyst_date
+- **D4**: Severe data-quality issue preventing catalyst confirmation (delisted, merged, retracted filing)
+- **D5**: Core data fields mutually inconsistent (market cap × shares ≠ price)
+
+All other concerns → PROCEED with `conflict_level` flag. On LLM call failure, defaults to PROCEED with `conflict_level=high` (better to surface flagged than lose silently). LLM client (`orchestrator/llm_client.py`) does one retry on transient failure.
 | 2 (Quant) | Deterministic VSA + RS | **No** (v3) |
 | 3 (Synthesis) | Composite scoring (Python) + narrative (LLM) | LLM narrative only |
 

@@ -334,12 +334,52 @@ def run_agent3(
     if agent1.regime_override and confidence == "High":
         confidence = "Medium"
 
+    # Build the partial result that captures everything deterministic.
+    # On rejection we return this with `discard_reason` set instead of None,
+    # so the pipeline can log component scores for tuning analysis.
+    def _partial(reason: str | None) -> "Agent3Result":
+        return Agent3Result(
+            ticker=agent1.ticker,
+            thesis="",
+            invalidation_trigger="",
+            daily_monitors=[],
+            confidence=confidence,
+            composite_score=composite,
+            catalyst_strength_score=catalyst_strength,
+            quant_confirmation_score=quant,
+            risk_asymmetry_score=risk,
+            information_asymmetry_score=info_asym,
+            data_quality_score=data_quality,
+            marginal_buyer_score=_deterministic_marginal_buyer_score(agent2),
+            marginal_buyer_analysis="",
+            bear_summary=agent1b.bear_summary,
+            catalyst_type=agent1.catalyst_type,
+            catalyst_type_prior=prior,
+            confirming_signals=signals.confirming_signals,
+            confirming_signal_count=signals.confirming_signal_count,
+            signal_bonus=signal_bonus,
+            probationary=agent1.probationary,
+            liquidity_warning=agent1.liquidity_warning,
+            short_interest_flag=agent2.short_interest_flag,
+            stale_data_flag=agent2.stale_data_flag,
+            sector_beta_flag=agent2.sector_beta_flag,
+            rs_vs_iwm=agent2.rs_vs_iwm,
+            proxies_computed=agent2.proxies_computed,
+            missing_data_fields=list(set(agent1.missing_data + agent2.missing_data)),
+            days_since_catalyst=days_since,
+            high_upside_score=high_upside_score,
+            high_upside_markers=high_upside_markers,
+            regime_override=agent1.regime_override,
+            recommended_hold_days=recommended_hold,
+            discard_reason=reason,
+        )
+
     # Hard floor: anything below HIGH_UPSIDE_COMPOSITE_FLOOR is too weak to surface in any pool.
     if composite < HIGH_UPSIDE_COMPOSITE_FLOOR:
-        return None
+        return _partial(f"composite {composite:.2f} below floor {HIGH_UPSIDE_COMPOSITE_FLOOR}")
     # Sub-threshold candidates only get through if they qualify for the high-upside pool.
     if composite < COMPOSITE_MIN and not qualifies_high_upside:
-        return None
+        return _partial(f"composite {composite:.2f} below {COMPOSITE_MIN} and high_upside ({high_upside_score:.1f}) below {HIGH_UPSIDE_SCORE_MIN}")
 
     llm = _llm_narrative(agent1, agent1b, agent1c, agent2, signals, budget)
 

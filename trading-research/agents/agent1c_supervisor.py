@@ -38,29 +38,29 @@ def run_agent1c(
     budget: BudgetManager,
 ) -> Agent1CResult:
 
-    prompt = f"""You are Agent 1C (Supervisor). Identify whether the conflict between Bull and Bear is resolvable.
-You do NOT pick a winner.
+    prompt = f"""You are Agent 1C (Supervisor). Your only job is to decide whether the Bear has identified a SPECIFIC DATA OR MATH ERROR in the Bull thesis that makes the trade impossible to evaluate. You do NOT pick a winner. You do NOT weigh risk.
 
-STRATEGY CONTEXT: This is a quantitative momentum strategy that deliberately targets overlooked, neglected,
-and often unappealing small/mid-cap stocks. Messy companies, controversial management, and litigious histories
-are EXPECTED — that is exactly where the information asymmetry and neglect alpha comes from.
+STRATEGY CONTEXT: This is a quantitative momentum strategy that deliberately targets overlooked, neglected, and often unappealing small/mid-cap stocks. Messy companies, controversial management, litigation overhang, and ugly charts are EXPECTED — that is the source of the alpha. Risk is priced via the deterministic scoring layer (catalyst strength, quant, risk_asymmetry, info_asymmetry). Your job is NOT to add more risk-weighting on top.
 
-CRITICAL RULE: Disqualify ONLY on DATA or MATH conflicts. Specifically:
-- Mathematical errors in the bull thesis (numbers don't add up)
-- Factual contradictions that are irresolvable with available data (e.g. Bear proves catalyst date is wrong)
-- The catalyst has ALREADY been reported in mainstream financial media (priced in)
-- Data quality is so poor that no conclusion is possible
+DISQUALIFY only if at least one of these is TRUE (closed list — nothing else qualifies):
 
-DO NOT DISQUALIFY for any of the following — these are features, not bugs:
-- Company reputation or management controversy
-- Litigation history or pending lawsuits (unless they directly threaten the specific catalyst)
-- Controversial industry or ethical concerns
-- Overleveraged balance sheet (already factored into scoring via quant/risk components)
-- Bear case is "this might not work" without citing a specific irresolvable data conflict
-- Bear score is high but based on speculation rather than fact
+  D1. The Bear cites a specific numerical/factual error in the Bull thesis (e.g. "Bull says $40M contract but USAspending shows $4M").
+  D2. The Bear proves the catalyst date is wrong or the catalyst doesn't exist as described.
+  D3. The catalyst has already been reported by mainstream financial media (WSJ, Bloomberg, Reuters, FT) BEFORE the bull's catalyst_date — meaning the signal is already public information.
+  D4. The Bear identifies a data-quality issue so severe that the catalyst itself cannot be confirmed (e.g. ticker has been delisted, company merged, filing was retracted).
+  D5. Multiple core data fields in the bull thesis are mutually inconsistent in ways that cannot be reconciled (e.g. market cap vs share count vs price don't multiply).
 
-When in doubt about a DATA conflict: DISQUALIFIED.
-When the Bear's argument is qualitative risk/opinion rather than factual contradiction: PROCEED.
+PROCEED in ALL other cases. Specifically — these are NOT disqualifications:
+
+  - High short interest (this is a +0.4 risk_asymmetry signal in our strategy, NOT a bear signal)
+  - Litigation, class actions, short-seller reports (priced via the scoring layer)
+  - Management reputation, governance concerns, board/insider relationships
+  - Macro/sector headwinds
+  - "Stock might keep going down" without a specific data error
+  - Bear is convincing but doesn't cite a D1-D5 violation
+  - You feel uncertain — uncertainty is NOT a disqualifier; it's flagged via conflict_level=high
+
+DEFAULT: PROCEED. The cost of a false-PROCEED is a Speculative-confidence trade that gets caught by the composite floor. The cost of a false-DISQUALIFY is permanently losing a real signal. Bias toward PROCEED.
 
 STOCK: {bull.ticker} ({bull.company_name})
 
@@ -75,23 +75,29 @@ BEAR FLAGS: priced={bear.catalyst_already_priced} | momentum_only={bear.momentum
 CONTRACT MATERIALITY: {bear.contract_materiality_concern}
 NEGLECT VALIDITY: {bear.neglect_validity_concern}
 
-For each conflict: is it a resolvable DATA disagreement, or a speculative risk opinion?
-Disqualify only on irresolvable data/math conflicts. Risk opinions → PROCEED.
+Check each D1-D5 condition against the Bear summary. If NONE match, PROCEED — even if the Bear case is strong, even if you have qualitative doubts.
+
+If you DISQUALIFY, your `disqualify_reason` MUST start with "D1:", "D2:", "D3:", "D4:", or "D5:" and cite the specific data point. Generic phrases like "irresolvable conflict", "multiple concerns", or "data quality issues" are NOT valid disqualification reasons.
 
 Return ONLY valid JSON:
 
 {{
   "outcome": "PROCEED" or "DISQUALIFIED",
-  "disqualify_reason": "<if DISQUALIFIED, the specific irresolvable DATA conflict — must cite data, not opinion>",
+  "disqualify_reason": "<if DISQUALIFIED, starts with D1:/D2:/D3:/D4:/D5: and cites the specific data point>",
   "conflict_points": ["<conflict 1>", "<conflict 2>"],
-  "resolution_summary": "<if PROCEED, how conflicts were resolved>",
+  "resolution_summary": "<if PROCEED, one sentence on the main conflict and why it's a risk concern, not a data conflict>",
   "conflict_level": "low" or "medium" or "high"
 }}"""
 
+    # Default on LLM call failure: PROCEED with conflict_level=high.
+    # Rationale: a silent infra failure should not permanently kill a real signal.
+    # The downstream composite floor (3.5) + Speculative confidence cap still gate
+    # marginal candidates. Better to surface flagged than to lose silently.
     default = Agent1CResult(
         ticker=bull.ticker,
-        outcome=DISQUALIFIED,
-        disqualify_reason="Supervisor call failed — defaulting to DISQUALIFIED per uncertainty rule",
+        outcome=PROCEED,
+        disqualify_reason="",
+        resolution_summary="Supervisor call failed — defaulted to PROCEED with elevated conflict level. Trade with extra caution.",
         conflict_level="high",
     )
 

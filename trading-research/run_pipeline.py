@@ -254,15 +254,24 @@ def main(dry_run: bool = False):
 
         # Agent 3 — neglect screen already passed in agent1 for all a1 results
         a3 = run_agent3(a1, a1b, a1c, a2, signals, True, budget)
-        if a3 is None:
-            reason = f"Composite below {COMPOSITE_MIN} threshold"
+        rejected = a3 is None or (a3 is not None and a3.discard_reason is not None)
+        if rejected:
+            reason = (a3.discard_reason if a3 is not None and a3.discard_reason
+                      else f"Composite below {COMPOSITE_MIN} threshold")
             disqualified_log.append({"ticker": a1.ticker, "reason": reason})
+
+        if a3 is None:
+            # Shouldn't happen post-refactor, but keep the safety net.
             log_candidate(run_id, {"ticker": a1.ticker, "discard_reason": reason,
                                    "catalyst_type": a1.catalyst_type})
             continue
 
-        agent3_results.append(a3)
+        if not rejected:
+            agent3_results.append(a3)
 
+        # Log the full score breakdown for BOTH surfaced and rejected candidates.
+        # Rejected candidates have thesis="" and no narrative, but the deterministic
+        # components are populated — that's the data we need to tune the composite floor.
         log_candidate(run_id, {
             "ticker": a3.ticker,
             "composite_score": a3.composite_score,
@@ -301,6 +310,7 @@ def main(dry_run: bool = False):
             "high_upside_score": a3.high_upside_score,
             "high_upside_markers": a3.high_upside_markers,
             "regime_override": int(a3.regime_override),
+            "discard_reason": a3.discard_reason or "",
         })
 
     # ── Kill criteria checks ──────────────────────────────────────────────

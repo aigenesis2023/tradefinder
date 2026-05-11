@@ -180,15 +180,35 @@ def _enrich_ticker(ticker: str) -> dict:
 
 # ── Scoring helpers ────────────────────────────────────────────────────────
 
-def _get_coverage_score(analyst_count: int) -> float:
+COVERAGE_FLOOR = 2.0
+DRAWDOWN_BOOST_THRESHOLD = 0.70  # price < 70% of 52w high counts as sentiment-dislocation
+DRAWDOWN_BOOST = 1.0
+
+
+def _get_coverage_score(analyst_count: int, price: float = 0.0, high_52w: float = 0.0) -> float:
+    """
+    Coverage-gap score. High analyst count penalises the score (less neglect = less edge),
+    but with two refinements:
+      1. Floor at COVERAGE_FLOOR so heavy-coverage names aren't mathematically excluded
+         from ever scoring above 3.0 on info_asymmetry (the 0.40-weighted component would
+         otherwise zero out and cap the whole metric at 3.0 max).
+      2. Drawdown boost: heavy coverage with the stock deep in a drawdown is
+         sentiment-dislocation, not priced-in. Bullish target + bearish tape +
+         insider buying is a different setup from "well-known and fully priced."
+    """
     if analyst_count <= 3:
-        return 5.0
+        base = 5.0
     elif analyst_count <= 5:
-        return 4.0
+        base = 4.0
     elif analyst_count <= 8:
-        return 3.0
+        base = 3.0
     else:
-        return max(0.0, 3.0 - (analyst_count - 8) * 0.3)
+        base = max(COVERAGE_FLOOR, 3.0 - (analyst_count - 8) * 0.3)
+
+    if price > 0 and high_52w > 0 and (price / high_52w) < DRAWDOWN_BOOST_THRESHOLD:
+        base = min(5.0, base + DRAWDOWN_BOOST)
+
+    return base
 
 
 def _get_catalyst_type_prior(catalyst_type: str) -> float:
@@ -484,11 +504,6 @@ def run_agent1(
         if not enriched:
             continue
 
-        country = enriched.get("country", "").lower()
-        if country and country not in ("united states", "usa", "us"):
-            print(f"[Agent1] Discarding {ticker}: foreign company ({country})")
-            continue
-
         market_cap_m = enriched.get("market_cap_m", 0)
         keep, probationary, discard_reason = _apply_market_cap_rules(market_cap_m)
         if not keep:
@@ -547,7 +562,11 @@ def run_agent1(
                 print(f"[Agent1] {ticker}: neglect screen 2/4 — will cap at Medium confidence")
 
         analyst_count = neglect.analyst_count
-        coverage_score = _get_coverage_score(analyst_count)
+        coverage_score = _get_coverage_score(
+            analyst_count,
+            price=enriched.get("price", 0.0),
+            high_52w=enriched.get("high_52w", 0.0),
+        )
 
         days_since = _days_since(catalyst_date)
         price_change_pct = _price_change_since_date(ticker, catalyst_date)

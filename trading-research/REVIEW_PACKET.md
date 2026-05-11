@@ -228,7 +228,8 @@ If you only have time for three pieces of feedback:
 ```
 /trading-research/
 ├── run_pipeline.py                    # entry point + report formatter
-├── CLAUDE.md                          # normative rulebook
+├── CLAUDE.md                          # normative rulebook (v3)
+├── REVIEW_PACKET.md                   # this document
 ├── agents/
 │   ├── agent1_bull.py                 # discovery + bull narrative + elite filter
 │   ├── agent1b_bear.py                # pre-mortem
@@ -257,9 +258,10 @@ If you only have time for three pieces of feedback:
 
 ## 10. SUMMARY OF STATE
 
-- **Architecture**: stable; bugs from v2 fixed.
-- **Empirical foundation**: solid for insider clusters at 30d (n=93, +3.92% alpha). 10d horizon defensible from same dataset.
-- **Untested**: elite-override thresholds, high-upside scoring weights, government contract catalyst, full LLM pipeline lift.
-- **Next step (post-feedback)**: 60-day paper trading window beginning when reviewer feedback is incorporated.
+- **Architecture**: stable; all 10 v2 audit issues fixed; insider lookback tightened 45→21 days.
+- **Empirical foundation**: solid for insider clusters (n=93, +3.92% IWM-adjusted alpha at 30d / +2.93% at 10d). 10d horizon defensible from same dataset.
+- **Untested**: elite-override thresholds, high-upside scoring weights, government contract catalyst alpha, full-LLM-pipeline lift over the +1.31% raw baseline.
+- **Engine state**: ready to run live (`python run_pipeline.py`). Committed at HEAD; rollback point exists.
+- **Next step**: incorporate reviewer feedback, then 60-day paper-trading window for YouTube case study.
 
 Reviewer: anything that looks wrong, brittle, or missing — call it out. We will not be defensive. Specifically welcome contrarian takes on the holding-period decision and the elite-override design.

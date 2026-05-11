@@ -204,7 +204,7 @@ High Conviction definition: composite ≥ 3.5 AND asymmetry ≥ 3.5 AND neglect 
 |---|---|---|
 | 1 (Bull) | Discovery + thesis | Yes (narrative only) |
 | 1B (Bear) | Pre-mortem failure case | Yes |
-| 1C (Supervisor) | Identifies irresolvable conflict — disqualifies on uncertainty, never defaults to Bull | Yes |
+| 1C (Supervisor) | Identifies irresolvable **data/math** conflict — disqualifies on uncertainty, never defaults to Bull. Does NOT disqualify on reputation, litigation, controversy, or ethics. | Yes |
 | 2 (Quant) | Deterministic VSA + RS | **No** (v3) |
 | 3 (Synthesis) | Composite scoring (Python) + narrative (LLM) | LLM narrative only |
 

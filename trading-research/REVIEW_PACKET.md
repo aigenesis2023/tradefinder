@@ -2,7 +2,7 @@
 
 A self-contained packet for an outside reviewer (Gemini, GPT, Grok, or human) to critique a trading research system. Paste the whole document in and ask for design / architecture / empirical critique.
 
-**What changed since v2 (this session):**
+**What changed in v3 (initial build session):**
 - Audited the entire codebase against the rulebook; found 10 issues, fixed all.
 - Discovered and fixed a silent bug that was capping insider catalyst-strength at 2.5 (about 44% reduction on the primary signal driver).
 - Added an **Elite-Override mode**: regime-gate failure no longer terminates the run; instead the engine surfaces only top-decile signals.
@@ -10,6 +10,10 @@ A self-contained packet for an outside reviewer (Gemini, GPT, Grok, or human) to
 - Switched the expected holding horizon from 30 days to **10 days** based on per-day alpha analysis of the same backtest.
 - Removed all dead code (Agent 4, the N² LLM theme-clustering pass).
 - Tightened the insider-scanner lookback from 45 days to **21 days**. Empirical alpha lives within ~15 days of cluster_end; older signals were being decayed out anyway but were still consuming pipeline budget.
+
+**What changed post-review (v3.1):**
+- **Hybrid exit horizon**: measured 60/90/180d outcomes on the backtest (n=93). 60 trading-day window shows +7.82% IWM-adj alpha and 73% win rate (ex-COVID). Standard time stop remains 10 days for capital efficiency; elite/HC setups (5+ insiders OR composite ≥ 3.5 + upside score ≥ 3.0) now get a 20 trading-day time stop. Engine outputs `recommended_hold_days` per idea.
+- **Safety bias fix**: Agent 1B (Bear) now explicitly instructed to argue financial/data-based cases only — reputation, litigation, controversy, and ethics are not disqualifiers. Agent 1C (Supervisor) disqualifies only on irresolvable data/math conflicts, not qualitative risk opinions. The strategy deliberately targets unappealing stocks; that IS the alpha.
 
 Full rationale and tables below.
 
@@ -46,19 +50,25 @@ A multi-agent research engine that surfaces high-conviction long ideas in small/
 
 ### Holding-period analysis (production cohort, n=93)
 
-This was run this session to decide the exit horizon:
+Full sweep now measured (60/90/180d added post-review):
 
-| Horizon | Alpha | Alpha-win | Std | **Per-day alpha** | **Alpha/Std** |
+| Horizon | Raw mean | Median | Win rate | Per-day | IWM-adj alpha |
 |---|---|---|---|---|---|
-| 7d | +1.32% | 60% | 9.70% | 0.188% | 0.136 |
-| **10d** | **+2.93%** | 58% | 12.46% | **0.293%** | **0.235** |
-| 30d | +3.92% | 69% | 17.30% | 0.131% | 0.227 |
+| 7d | — | — | — | 0.188% | +1.32% |
+| **10d** | +1.84% | +0.18% | 52.7% | **0.249%** | +2.93% |
+| 30d | +3.37% | +3.87% | 59.1% | 0.112% | +3.92% |
+| **60d** | +8.65% | +10.36% | **73.1%** | 0.144% | **+7.82%** |
+| 90d | +10.35% | +16.42% | 67.9% | 0.116% | +7.60% |
+| 180d | — | −8.01% | 35.5% | 0.013% | **−8.95%** |
 
-**Why 10d is the chosen horizon:**
-- Best per-day alpha rate (>2x vs 30d).
-- Best risk-adjusted alpha (alpha/std).
-- Tight enough that macro/geopolitical/sector noise has limited time to overwrite the signal.
-- 30d has higher total alpha and win rate but lower turnover → worse compounding.
+(60/90/180d figures are ex-COVID, n=78.)
+
+**Hybrid horizon decision:**
+- 10d default: best per-day alpha (0.249%/td), best capital efficiency, lowest macro noise.
+- 20d for elite/HC (5+ insiders OR composite ≥ 3.5 + upside score ≥ 3.0): 60d window shows signal keeps running for strong setups; 20d captures more without open-ended holding.
+- 180d collapses to −8.95% IWM-adj. Do not overstay.
+
+Engine now outputs `recommended_hold_days` (10 or 20) per idea.
 
 ### Elite cohort (5+ insiders, $500M–$5B, n=7 — small sample but striking)
 
@@ -68,10 +78,9 @@ This was run this session to decide the exit horizon:
 | 10d | **+6.68%** | 57% |
 | 30d | +0.05% | 57% |
 
-**Elite signals capture all their alpha in days 7–10 then mean-revert by day 30.** This drove the design of the High-Upside / Elite-Override paths.
+Elite signals front-load alpha in days 7–10. 20d extended hold is a compromise: more than 10d while respecting the 30d mean-reversion.
 
 ### What we DON'T have data on
-- Outcomes past 30 days (could not measure 60d, 90d, 180d in this backtest)
 - Government contract signal alpha (entire backtest is on insider clusters)
 - Full-LLM-pipeline outcomes (only raw mechanical filter was backtested)
 - Live paper-trading outcomes (zero closed trades to date)
@@ -91,7 +100,7 @@ This was run this session to decide the exit horizon:
 |---|---|---|
 | 1 (Bull) | Discovery + thesis | Yes (judgment only — scoring is in Python) |
 | 1B (Bear) | Pre-mortem failure case | Yes |
-| 1C (Supervisor) | Identifies irresolvable conflict; **disqualifies on uncertainty** | Yes |
+| 1C (Supervisor) | Identifies irresolvable **data/math** conflict; disqualifies on uncertainty. Reputation, litigation, controversy = NOT disqualifiers. | Yes |
 | 2 (Quant) | VSA proxies + RS vs IWM | **No** (now fully deterministic) |
 | 3 (Synthesis) | Composite scoring, thesis narrative, invalidation trigger | LLM for narrative only; scoring 100% Python |
 
@@ -175,10 +184,12 @@ Squeeze contribution to `risk_asymmetry` raised from +0.2 to +0.4. High short in
 
 The engine outputs signals; the human executes. Recommended exit hierarchy:
 
-1. **Profit target** (~+8%) → take profit
+1. **Profit target** (~+8% standard, ~+12% high-upside) → take profit
 2. **Stop loss** (~−6% from entry) → cut loss
 3. **Invalidation trigger fires** (Agent 3 outputs a specific event per idea) → exit
-4. **Time stop at 10 days** → exit because nothing else fired
+4. **Time stop** (per `recommended_hold_days` in report):
+   - Standard: **10 trading days**
+   - Elite/HC (5+ insiders OR composite ≥ 3.5 + upside ≥ 3.0): **20 trading days**
 
 The time stop only governs trades that drift — most trades resolve via #1, #2, or #3 first.
 
@@ -189,10 +200,10 @@ The time stop only governs trades that drift — most trades resolve via #1, #2,
 These are the things we genuinely want a second opinion on. Please critique any/all:
 
 ### Empirical
-1. **Is 10-day horizon defensible?** Best per-day alpha and best alpha/std in the data, but the higher win rate at 30d is real. Are we leaving "win rate alpha" on the table by exiting early?
-2. **Elite cohort sample size (n=7) is small.** The 30d mean-reversion pattern is striking but could be noise. Should we hold the 10-day rule for elite only, or universally?
+1. ~~Is 10-day horizon defensible?~~ **RESOLVED.** 60d data measured (n=78, ex-COVID): 73% win rate, +7.82% IWM-adj. Hybrid horizon implemented: 10d standard, 20d elite/HC. 180d shows −8.95% mean-reversion confirming no-hold-indefinitely rule.
+2. **Elite cohort sample size (n=7) is small.** The 30d mean-reversion pattern is striking but could be noise. The 20d hold is a compromise.
 3. **The government contract signal has zero empirical validation in this backtest.** It's kept as a prior-1.0 catalyst on intuition + general literature. Should it be parked until we backtest contracts specifically?
-4. **No data beyond 30 days.** If the user's intuition is right that insiders predict longer-term growth, we'd see continued outperformance at 60–180d. We can measure this — should we, before locking in 10d?
+4. ~~No data beyond 30 days.~~ **RESOLVED.** 60/90/180d measured. See §2.
 
 ### Architectural
 5. **Elite-Override mode is unvalidated.** Thresholds were picked by intuition (5+ insiders, 25%+ revenue). Reasonable? Too lax? Too strict?

@@ -63,7 +63,7 @@ When the regime gate fails, the engine does NOT terminate. It runs in elite-only
 
 ### Insider cluster definition (`orchestrator/insider_scanner.py`)
 
-- **3+** unique insiders, each ≥$100K open-market purchase (Form 4 code "P"), within a 14-day window. Scanned 45 days back.
+- **3+** unique insiders, each ≥$100K open-market purchase (Form 4 code "P"), within a 14-day window. Scanned 21 days back (tightened from 45 days in v3 — empirical alpha lives within ~15 days of cluster_end; older signals were getting decayed out anyway and consuming pipeline budget).
 - Qualifying roles: CEO, CFO, COO, Chairman, Director, President, EVP, SVP.
 - Institutional entity names filtered (LLC, LP, fund, etc.).
 - 10b5-1 plan transactions excluded.

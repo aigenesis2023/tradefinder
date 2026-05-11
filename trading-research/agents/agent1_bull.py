@@ -401,7 +401,7 @@ def run_agent1(
     for entry in insider_eligible:
         ticker = entry["ticker"]
         try:
-            cluster = scan_insider_buying(ticker, days_back=45)
+            cluster = scan_insider_buying(ticker, days_back=21)
             if cluster.detected:
                 insider_hit_map[ticker] = cluster
         except Exception as e:

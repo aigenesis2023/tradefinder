@@ -55,6 +55,14 @@ RECOMMENDED_HOLD_DAYS = 90         # Jeng et al., Cohen-Malloy-Pomorski, Lakonis
 TRANSACTION_COST_PCT = 1.0         # realistic round-trip cost assumption for retail $5K–$25K
 MAX_RISK_PER_TRADE_PCT = 2.0       # of portfolio equity (flat, no cluster-size tier)
 
+# Short-interest "disagreement" band (Chung-Sul-Wang 2019, informational only)
+# Insider buying into heavily-shorted-but-not-extreme stocks has shown stronger
+# academic returns than insider buying alone. Upper bound filters out fraud/distress
+# names where insiders may buy defensively. NOT a gate — surfaced as a tag for the
+# operator's discretionary research.
+DISAGREEMENT_SI_LOW_PCT = 10.0
+DISAGREEMENT_SI_HIGH_PCT = 40.0
+
 # Scan limits
 MAX_TICKERS_TO_SCAN = 500          # universe is already filtered to $200M-$3B
 MAX_REPORT_IDEAS = 15              # screening-tool: surface more candidates for review
@@ -75,6 +83,8 @@ class InsiderSignal:
     materiality_pct: float
     avg_daily_dollar_volume: float
     entry_price_estimate: float
+    short_interest_pct: float | None = None    # % of float; None when data missing
+    disagreement_flag: bool = False             # True when SI within DISAGREEMENT band
     insider_names: list = field(default_factory=list)
     insider_roles: list = field(default_factory=list)
     liquidity_warning: bool = False
@@ -89,12 +99,23 @@ def _enrich_ticker(ticker: str) -> dict:
         price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
         avg_volume = float(hist["Volume"].mean()) if not hist.empty else 0
         avg_dollar_vol = avg_volume * price
+
+        # yfinance returns shortPercentOfFloat as a decimal (e.g. 0.15 = 15%).
+        # Some tickers also expose shortPercentOfSharesOutstanding; we prefer % of float.
+        si_raw = info.get("shortPercentOfFloat")
+        if si_raw is None or si_raw == 0:
+            si_raw = info.get("sharesPercentSharesOut")
+        short_interest_pct = (
+            round(float(si_raw) * 100, 2) if si_raw is not None and si_raw > 0 else None
+        )
+
         return {
             "market_cap_m": round(market_cap_m, 2),
             "price": round(price, 4),
             "avg_daily_dollar_volume": round(avg_dollar_vol, 2),
             "company_name": info.get("longName") or ticker,
             "sector": info.get("sector") or "",
+            "short_interest_pct": short_interest_pct,
         }
     except Exception:
         return {}
@@ -113,6 +134,11 @@ def _build_signal(cluster: InsiderCluster, enriched: dict) -> InsiderSignal:
     materiality_pct = (
         (cluster.total_usd / (market_cap_m * 1e6)) * 100 if market_cap_m > 0 else 0
     )
+    si_pct = enriched.get("short_interest_pct")
+    disagreement_flag = bool(
+        si_pct is not None
+        and DISAGREEMENT_SI_LOW_PCT <= si_pct <= DISAGREEMENT_SI_HIGH_PCT
+    )
     return InsiderSignal(
         ticker=cluster.ticker,
         company_name=enriched.get("company_name", cluster.ticker),
@@ -127,6 +153,8 @@ def _build_signal(cluster: InsiderCluster, enriched: dict) -> InsiderSignal:
         materiality_pct=round(materiality_pct, 4),
         avg_daily_dollar_volume=enriched.get("avg_daily_dollar_volume", 0),
         entry_price_estimate=enriched.get("price", 0),
+        short_interest_pct=si_pct,
+        disagreement_flag=disagreement_flag,
         insider_names=sorted({t.name for t in cluster.transactions}),
         insider_roles=sorted({t.role for t in cluster.transactions if t.role}),
         liquidity_warning=enriched.get("avg_daily_dollar_volume", 0) < MIN_DOLLAR_VOLUME,
@@ -172,13 +200,19 @@ def _format_report(
                 else f"{s.opportunistic_count}/{s.unique_insiders} opportunistic"
             )
             liq = " ⚠ THIN LIQUIDITY" if s.liquidity_warning else ""
+            disagreement = " ⚡ DISAGREEMENT (high SI + insider buying)" if s.disagreement_flag else ""
+            if s.short_interest_pct is None:
+                si_line = "Short interest: not available"
+            else:
+                si_line = f"Short interest: {s.short_interest_pct:.1f}% of float"
             lines.append("")
-            lines.append(f"{i}. {s.ticker} — {s.company_name}")
+            lines.append(f"{i}. {s.ticker} — {s.company_name}{disagreement}")
             lines.append(f"   Cluster: {s.unique_insiders} insiders | ${s.total_usd:,.0f} total | {s.materiality_pct:.3f}% of mcap")
             lines.append(f"   Quality: {quality_flag}{liq}")
             if s.routine_insiders:
                 lines.append(f"   Routine traders (low signal value): {', '.join(s.routine_insiders)}")
             lines.append(f"   Market cap: ${s.market_cap_m:,.0f}M | ADV: ${s.avg_daily_dollar_volume:,.0f}")
+            lines.append(f"   {si_line}")
             lines.append(f"   Cluster window: {s.cluster_start} → {s.cluster_end} | Signal date: {s.signal_date}")
             lines.append(f"   Insiders: {', '.join(s.insider_names)}")
             if s.insider_roles:
@@ -205,6 +239,8 @@ def _format_report(
     lines.append(f"  Realistic gross return:     2–4% per 90d trade (median academic estimate)")
     lines.append(f"  Realistic net return:       1–3% per 90d trade after costs")
     lines.append(f"  Opportunistic flag (CMP):   informational only; do not auto-trade routine clusters")
+    lines.append(f"  ⚡ DISAGREEMENT flag:        short interest {DISAGREEMENT_SI_LOW_PCT:.0f}–{DISAGREEMENT_SI_HIGH_PCT:.0f}% of float (insiders buying into elevated shorts)")
+    lines.append(f"                              Chung-Sul-Wang 2019. Informational only; not a gate.")
     lines.append("")
     lines.append("DO YOUR OWN RESEARCH ON EACH SURFACED TICKER BEFORE TRADING.")
     return "\n".join(lines)

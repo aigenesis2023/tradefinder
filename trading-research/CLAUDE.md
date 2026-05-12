@@ -59,6 +59,38 @@ of several inputs. Hard gating reduces candidate surface for research.
 
 ---
 
+## The short-interest "disagreement" flag (informational only)
+
+Per Chung, Sul, and Wang (2019, *Journal of Portfolio Management*): when insider buying
+coincides with elevated short interest, abnormal returns are amplified — corporate
+insiders (with private information) buying against the market's bet (heavy short positioning)
+creates a positively-skewed payoff distribution. Forced covering on positive catalysts
+adds mechanical upward pressure on top of the information edge.
+
+The engine fetches `shortPercentOfFloat` from yfinance for each surfaced ticker and tags
+clusters where short interest is between **10% and 40% of float** with a ⚡ DISAGREEMENT
+marker. The upper bound filters out distress/fraud names where insiders may buy
+defensively rather than informationally (Lee et al. 2018 — "false signaling" risk).
+
+**The engine does NOT gate on short interest.** Reasons:
+
+1. The Chung-Sul-Wang headline numbers show combined-signal lift mostly at 1-month
+   horizons; our 90-day hold sits in the decay window. Net incremental edge at 90d is
+   unclear.
+2. Gating at 10–40% SI cuts the candidate pool by an estimated ~90% — too few signals
+   for a discretionary screening tool.
+3. The false-signaling research (insiders buying defensively into shorted names with
+   price support fully reverting within a year) is a real failure mode the engine
+   should not bake in.
+
+Like the opportunistic flag, this is metadata for the operator's discretionary stage.
+
+Source for the short-interest value: `yfinance.Ticker.info["shortPercentOfFloat"]`
+(fallback to `sharesPercentSharesOut`). Data quality varies by ticker; `None` is
+reported when unavailable.
+
+---
+
 ## Empirical expectation (what to actually anticipate)
 
 Reasonable median estimates from post-2010 US literature for our exact configuration:

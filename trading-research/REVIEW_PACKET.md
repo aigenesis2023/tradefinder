@@ -1,4 +1,4 @@
-# Simplified Engine v2.1 — Review Packet
+# Simplified Engine v3.0 — Review Packet
 
 Self-contained packet for an outside reviewer. Paste the whole document in and ask
 for design / empirical / methodological critique.
@@ -13,17 +13,20 @@ realistic expectation is roughly 2–4% gross / 1–3% net per 90-day trade, com
 passive indexing on risk-adjusted terms. The engine's value is the screen, not the
 alpha.
 
-Earlier iterations of this project (v3.1) overclaimed validated edge with LLM
-narrative scaffolding, multi-factor scoring, and untested catalysts (government
-contracts, confirming signals). v1 stripped all of that to the validated mechanical
-cluster filter. v2 recalibrated parameters against academic literature
-(Cohen-Malloy-Pomorski 2012, Jeng-Metrick-Zeckhauser 2003, Lakonishok-Lee 2001,
-Chung-Sul-Wang 2019) rather than our own backtest, which we determined is
-statistically too small for sub-rule validation. **v2.1 incorporates external
-reviewer feedback** that flagged (a) the 90-day hold as on the short end of academic
-guidance, (b) the 14-day cluster window as artificially splitting coordinated
-campaigns, (c) the 0.02% materiality threshold as mathematically redundant, and
-(d) pure-routine clusters as worth auto-discarding rather than surfacing.
+Earlier iterations of this project (the original v3.1, unrelated to the current v3.0)
+overclaimed validated edge with LLM narrative scaffolding, multi-factor scoring, and
+untested catalysts. v1 stripped all of that to the validated mechanical cluster filter.
+v2 recalibrated parameters against academic literature (Cohen-Malloy-Pomorski 2012,
+Jeng-Metrick-Zeckhauser 2003, Lakonishok-Lee 2001, Chung-Sul-Wang 2019) rather than our
+own backtest. v2.1 incorporated external reviewer feedback (hold horizon, cluster
+window, materiality redundancy, opportunistic soft gate).
+
+**v3.0 is an architectural change**: discovery moved from per-ticker SEC EDGAR scanning
+(which required ~25–30 hours on cold cache to cover the $200M–$3B universe and was in
+practice capped at ~5% of the universe per run with no rotation) to OpenInsider's
+aggregated feed (single scrape returns all qualifying activity across the US market).
+The backtest already used OpenInsider; v3.0 aligns the live data path with the
+validated one. Parameters and academic anchors are unchanged from v2.1.
 
 ---
 
@@ -31,27 +34,42 @@ campaigns, (c) the 0.02% materiality threshold as mathematically redundant, and
 
 Daily mechanical scan:
 
-1. Loads a watchlist of US-listed primary-exchange tickers, $200M–$3B market cap (cached weekly).
-2. For each ticker, fetches SEC EDGAR Form 4 filings — recent **45 days** for cluster detection,
-   plus ~3 years of history for routine/opportunistic classification.
-3. Detects clusters: 3+ unique qualifying-role insiders, ≥$100K per transaction, **within 30 days**.
-4. Excludes 10b5-1 plan trades and institutional-entity filer names.
-5. **Soft-gate**: discards clusters with `opportunistic_count == 0` (pure-routine clusters
-   carry near-zero predictive content per CMP 2012).
-6. Re-fetches market cap via yfinance and discards if it has drifted outside $200M–$3B
-   since the (up-to-7-day-stale) watchlist cache.
-7. Tags three informational metadata fields per surfaced signal:
-   - **Opportunistic count** (Cohen-Malloy-Pomorski 2012): how many cluster members are
-     NOT routine traders (i.e., did NOT buy in the same calendar month for 3 consecutive
-     prior years).
+1. **OpenInsider feed scrape** for the last ~3 years of qualifying open-market purchases
+   across the entire US market. Quarterly chunks cached locally (1-hour TTL on the
+   current quarter, 1-week TTL on older). Filters at source: purchases only, ≥ $100K
+   per transaction.
+2. **Role + entity filter**: only CEO/CFO/COO/Chairman/Director/President/EVP/SVP
+   trades; institutional-entity filer names (LLC, LP, Fund, etc.) excluded.
+3. **Cluster detection**: per ticker, find the best 30-day window with ≥ 3 unique
+   insiders, within the last 45 days. Emit at most ONE cluster per ticker (fixes the
+   rolling-window-duplicate bug in the backtest's earlier detect_clusters).
+4. **Opportunistic classification** per CMP 2012: each cluster member is "routine" if
+   they bought in the same calendar month for 3 consecutive prior years in the
+   scraped history; otherwise opportunistic.
+5. **Opportunistic soft gate**: discard clusters with `opportunistic_count == 0`.
+6. **yfinance enrichment** per surviving cluster: market cap, ADV, short interest,
+   analyst count, sector. Runs only on detected candidates (typically 5–30 per scan),
+   not the whole universe.
+7. **Market cap filter**: discard if market cap outside $200M–$3B.
+8. **Tags three informational metadata fields** per surfaced signal:
+   - **Opportunistic count** (CMP 2012): non-routine cluster members.
    - **Short interest + DISAGREEMENT flag** (Chung-Sul-Wang 2019): % of float shorted,
      plus ⚡ tag when between 10–40% (insiders buying into elevated shorts).
    - **Analyst coverage count** (Lakonishok-Lee 2001): # of sell-side analysts.
-8. Outputs a ranked report (by opportunistic_count → unique_insiders → materiality)
+9. **Output** a ranked report (by opportunistic_count → unique_insiders → materiality)
    with full metadata per candidate.
-9. **No LLM. No scoring formula. No regime gating. No sizing multipliers. No materiality
-   % filter (removed in v2.1 — was mathematically redundant). The only quality gate beyond
-   the cluster filter is the opportunistic soft gate.**
+
+**No LLM. No scoring formula. No regime gating. No sizing multipliers. No fixed
+materiality % filter (removed in v2.1). The only quality gate beyond the cluster
+filter is the opportunistic soft gate.**
+
+10b5-1 plan trades: OpenInsider does not directly tag these as a separate transaction
+type. The scrape's `xp=1` parameter returns all open-market purchases (P-code) which
+includes some 10b5-1 plan trades. In practice the cluster requirement (3+ different
+insiders coordinating within 30 days) makes 10b5-1 plan trades exceptionally unlikely
+to drive a cluster (10b5-1 plans are pre-scheduled individually months in advance and
+do not coordinate across executives). This is a slight relaxation from v2.1's EDGAR-
+based footnote check; reviewers may flag.
 
 The discretionary operator performs fundamental research (financials, news, valuation,
 sector context) on each surfaced ticker before any trade decision.
@@ -149,7 +167,7 @@ but do not gate.
 6. **Analyst coverage count** (Lakonishok-Lee 2001).
 7. **Explicit step-1 screening framing** — engine no longer pitched as alpha generator.
 
-**v2.1 (incorporating reviewer feedback):**
+**v2.1 (incorporating prior reviewer feedback):**
 8. **Hold horizon 90 → 180 days** — literature peaks ~6mo (Jeng et al.; CMP).
 9. **Cluster window 14 → 30 days + EDGAR lookback 21 → 45 days** — academic studies
    use 1-3 month windows; insider campaigns span weeks.
@@ -158,8 +176,16 @@ but do not gate.
     discard pure-routine clusters per CMP 2012 noise finding.
 12. **Documented IPO / new-listing edge case** — companies listed < 3 years ago default
     to all-opportunistic classification.
-13. **Documented fresh mcap re-check** — pipeline re-fetches market cap; out-of-band
-    drift since watchlist cache is caught.
+
+**v3.0 (architectural change — coverage problem):**
+13. **Discovery moved from per-ticker SEC EDGAR scan → OpenInsider aggregated feed.**
+    Prior pipeline runs covered ~5% of the universe per run with no rotation; v3.0
+    covers 100% of the US market in ~30 seconds on warm cache / ~5 minutes cold.
+14. **Single-cluster-per-ticker emission** — fixes the rolling-window-duplicate bug
+    that inflated the backtest cohort (SSP appeared 30 times in n=93 from one
+    continuous buying campaign).
+15. **Backtest and live data paths now identical** — both use OpenInsider. Prior
+    inconsistency (backtest = OpenInsider, live = EDGAR) is gone.
 
 ---
 
@@ -214,16 +240,19 @@ The engine reports `None` / "not available" honestly rather than guessing.
 
 ## 8. Four questions for the reviewer
 
-1. **Hold horizon now 180 days** (v2.1). Is this the right ceiling, or does the
-   literature support an even longer hold (12 months)? Capital efficiency trade-off?
+1. **OpenInsider-only architecture (v3.0).** Reliance on a third-party scraper for
+   primary discovery is a new dependency. Should we add a secondary discovery path
+   (SEC EDGAR direct) for redundancy, or accept the simpler single-source design?
 
-2. **Opportunistic soft gate (≥1)** is now the only quality gate beyond the cluster
-   filter itself. Is this the right level of strictness, or should it be tighter
-   (e.g., majority opportunistic) or looser (pure metadata)?
+2. **10b5-1 plans no longer explicitly excluded** (v3.0). The scrape returns all P-code
+   purchases without distinguishing 10b5-1 plan trades. Is the cluster requirement
+   (3+ coordinated executives) sufficient natural filter, or do we need an EDGAR-based
+   footnote check on detected clusters?
 
-3. **Cluster window now 30 days** with 45-day EDGAR lookback. Is this the right
-   width, or should it be wider (60 days) for completeness? Does the wider window
-   risk capturing unrelated activity that wasn't a real cluster?
+3. **Routine classification limitation.** OpenInsider's source-side filter (≥ $100K)
+   means we don't see sub-$100K routine buys. Insiders with habitual sub-$100K monthly
+   purchases will be mis-classified as opportunistic. Acceptable trade-off, or should
+   we hit EDGAR for full per-insider history on detected clusters?
 
 4. **Single biggest blind spot you see** that we haven't already flagged in section 7.
 
@@ -233,23 +262,27 @@ The engine reports `None` / "not available" honestly rather than guessing.
 
 ```
 trading-research/
-├── CLAUDE.md                       # normative rulebook (v2 with metadata sections)
+├── CLAUDE.md                       # normative rulebook (v3.0)
 ├── REVIEW_PACKET.md                # this document
-├── run_pipeline.py                 # main entry, 90d hold, no LLM
+├── run_pipeline.py                 # main entry, 180d hold, OpenInsider discovery, no LLM
 ├── orchestrator/
-│   ├── insider_scanner.py          # SEC EDGAR Form 4 + 3yr opportunistic classification
+│   ├── openinsider_feed.py         # v3.0 primary discovery via OpenInsider scrape
+│   ├── insider_scanner.py          # shared data types + classify_routine helper (CMP 2012)
 │   ├── regime_gate.py              # VIX/VIX3M, IWM 20d MA — informational only
-│   ├── universe_builder.py         # yfinance screener, $200M–$3B
+│   ├── universe_builder.py         # yfinance screener (legacy; unused in v3.0 main path)
 │   └── state_manager.py            # SQLite logging + dedup
 ├── backtest/
 │   ├── measure_absolute_returns.py # post-hoc measurement on n=65 cohort
+│   ├── openinsider_pull.py         # backtest's OpenInsider scrape (now mirrors live path)
 │   └── (validation infrastructure unchanged from v1)
 ├── data/                           # SQLite DB
-├── cache/                          # CIK map, Form 4 history, watchlist
+├── cache/
+│   ├── openinsider_live/           # v3.0: quarterly chunks of scraped feed (CSV)
+│   └── ...                         # legacy CIK map, Form 4 XML, watchlist
 └── research_logs/                  # per-run reports (markdown)
 ```
 
-Runtime surface (excluding backtest): ~1,400 lines of Python.
+Runtime surface (excluding backtest): ~1,200 lines of Python.
 
 ---
 

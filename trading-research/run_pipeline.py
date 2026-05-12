@@ -1,48 +1,44 @@
 """
-run_pipeline.py — Simplified Engine v2.1 (literature-aligned screening tool)
+run_pipeline.py — Simplified Engine v3.0 (OpenInsider-first architecture)
 
 Mechanical insider-cluster scanner. No LLM. No bull/bear debate. No composite scoring.
 No government contracts. No confirming signals. No neglect screen. No sizing multipliers.
 
-This is a STEP-1 SCREENING TOOL, not a complete trading strategy. It surfaces structurally
-meaningful insider-cluster events for the operator to then research further (fundamentals,
-news, sector context, valuation) before deciding whether to take a position. The engine
-does not claim a standalone edge; it provides a literature-validated starting universe
-for discretionary follow-up.
+v3.0 architecture (vs v2.1):
+  Prior: per-ticker SEC EDGAR scan — ~25-30 hours to cover the $200M-$3B universe,
+         and the scan only covered the first N tickers (~5% of universe per run).
+  Now:   single OpenInsider scrape returns all qualifying insider activity across the
+         entire US market; cluster detection runs on the aggregated set, then yfinance
+         enrichment runs only on the handful of detected candidates. Full-market
+         coverage in ~30 seconds on warm cache, ~5 minutes on cold cache.
+
+This is a STEP-1 SCREENING TOOL, not a complete trading strategy. It surfaces
+structurally meaningful insider-cluster events for the operator to then research
+further (fundamentals, news, sector context, valuation) before deciding whether to
+take a position. The engine does not claim a standalone edge.
 
 Calibrated against academic literature (see CLAUDE.md):
   - Cluster definition (3+ insiders, 30-day window, $100K each): Lakonishok-Lee 2001;
     Alldredge-Blank 2019; Kang et al. 2018.
   - Market cap band $200M–$3B: smaller-is-better consensus across studies.
-  - 180-day hold horizon: Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012;
-    Lakonishok-Lee 2001 (signal accrues over 3–12 months, peaks ~6 months).
-  - Opportunistic vs routine soft gate: Cohen-Malloy-Pomorski 2012 (≥1 opportunistic
-    insider required; pure-routine clusters carry near-zero predictive content).
-  - 10b5-1 exclusion: well-established; routine/scheduled trades carry no signal.
-
-v2.1 changes from v2:
-  - Hold horizon 90 → 180 days (literature peaks ~6mo)
-  - Cluster window 14 → 30 days (academic studies use 1-3 month windows)
-  - EDGAR lookback 21 → 45 days (accommodates wider cluster window)
-  - Removed 0.02% materiality threshold (was redundant with $100K × 3 minimum)
-  - Soft-gate clusters with 0 opportunistic insiders (CMP noise floor)
+  - 180-day hold horizon: Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012.
+  - Opportunistic vs routine soft gate: Cohen-Malloy-Pomorski 2012.
+  - 10b5-1 exclusion: well-established (OpenInsider filters at source via xp=1).
 
 Realistic expectation: 4–8% gross / 3–7% net per 180-day trade (median academic
-estimate for modern post-SOX US small/mid-cap clusters). Comparable to passive
-indexing on a risk-adjusted basis. The engine's value is the SCREEN, not the
-standalone edge.
+estimate). Comparable to passive indexing on risk-adjusted terms. The engine's value
+is the SCREEN, not the standalone edge.
 
 Usage:
   python run_pipeline.py
   python run_pipeline.py --dry-run
-  python run_pipeline.py --max-tickers 100
 """
 
 import argparse
 import sys
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -51,34 +47,27 @@ import yfinance as yf
 
 from orchestrator.state_manager import init_db, log_candidate, log_run_health, is_deduped
 from orchestrator.regime_gate import check_regime, regime_gate_header
-from orchestrator.universe_builder import build_neglected_universe
-from orchestrator.insider_scanner import scan_insider_buying, InsiderCluster
+from orchestrator.openinsider_feed import scan as scan_openinsider
+from orchestrator.insider_scanner import InsiderCluster
 
 
-# ── Validated thresholds (literature-aligned, v2.1) ───────────────────────
+# ── Validated thresholds (literature-aligned, v3.0) ───────────────────────
 MARKET_CAP_MIN_M = 200             # Lakonishok-Lee, Jeng et al.: smaller-cap stronger
 MARKET_CAP_MAX_M = 3000            # GPT/literature: $500M–$5B too wide; tighten
 MIN_DOLLAR_VOLUME = 500_000        # liquidity-warning threshold
-RECOMMENDED_HOLD_DAYS = 180        # v2.1: 6-month horizon (Jeng et al., Lakonishok-Lee,
-                                   # Cohen-Malloy-Pomorski). 90d was on the short end of
-                                   # academic guidance; insider-buying alpha builds over
-                                   # 3-12 months and peaks around 6 months.
-TRANSACTION_COST_PCT = 1.0         # realistic round-trip cost assumption for retail $5K–$25K
+RECOMMENDED_HOLD_DAYS = 180        # v2.1: 6-month horizon (academic literature peaks ~6mo)
+TRANSACTION_COST_PCT = 1.0         # realistic round-trip cost assumption for retail
 MAX_RISK_PER_TRADE_PCT = 2.0       # of portfolio equity (flat, no cluster-size tier)
-EDGAR_LOOKBACK_DAYS = 45           # window for current-cluster detection (3-year history
-                                   # is fetched separately by scanner for routine check)
+
+# OpenInsider feed parameters
+RECENT_WINDOW_DAYS = 45            # surface clusters whose cluster_end is within this window
+HISTORY_DAYS = 1100                # ~3 years for routine/opportunistic classification
 
 # Short-interest "disagreement" band (Chung-Sul-Wang 2019, informational only)
-# Insider buying into heavily-shorted-but-not-extreme stocks has shown stronger
-# academic returns than insider buying alone. Upper bound filters out fraud/distress
-# names where insiders may buy defensively. NOT a gate — surfaced as a tag for the
-# operator's discretionary research.
 DISAGREEMENT_SI_LOW_PCT = 10.0
 DISAGREEMENT_SI_HIGH_PCT = 40.0
 
-# Scan limits
-MAX_TICKERS_TO_SCAN = 500          # universe is already filtered to $200M-$3B
-MAX_REPORT_IDEAS = 15              # screening-tool: surface more candidates for review
+MAX_REPORT_IDEAS = 25              # full universe means more candidates to surface
 
 
 @dataclass
@@ -96,9 +85,9 @@ class InsiderSignal:
     materiality_pct: float
     avg_daily_dollar_volume: float
     entry_price_estimate: float
-    short_interest_pct: float | None = None    # % of float; None when data missing
-    disagreement_flag: bool = False             # True when SI within DISAGREEMENT band
-    analyst_count: int | None = None            # # of sell-side analysts covering (yfinance)
+    short_interest_pct: float | None = None
+    disagreement_flag: bool = False
+    analyst_count: int | None = None
     insider_names: list = field(default_factory=list)
     insider_roles: list = field(default_factory=list)
     liquidity_warning: bool = False
@@ -114,8 +103,6 @@ def _enrich_ticker(ticker: str) -> dict:
         avg_volume = float(hist["Volume"].mean()) if not hist.empty else 0
         avg_dollar_vol = avg_volume * price
 
-        # yfinance returns shortPercentOfFloat as a decimal (e.g. 0.15 = 15%).
-        # Some tickers also expose shortPercentOfSharesOutstanding; we prefer % of float.
         si_raw = info.get("shortPercentOfFloat")
         if si_raw is None or si_raw == 0:
             si_raw = info.get("sharesPercentSharesOut")
@@ -123,9 +110,6 @@ def _enrich_ticker(ticker: str) -> dict:
             round(float(si_raw) * 100, 2) if si_raw is not None and si_raw > 0 else None
         )
 
-        # Analyst coverage count — proxy for institutional attention. Lower = more
-        # under-researched = literature suggests stronger insider-trade alpha.
-        # Informational only; not a gate.
         analyst_raw = info.get("numberOfAnalystOpinions")
         analyst_count = int(analyst_raw) if analyst_raw is not None else None
 
@@ -187,13 +171,13 @@ def _format_report(
     run_id: str,
     regime,
     signals: list,
-    tickers_scanned: int,
+    candidates_evaluated: int,
     discarded_log: list,
 ) -> str:
     lines = []
     today = date.today().strftime("%Y-%m-%d")
-    lines.append(f"=== SIMPLIFIED ENGINE v2.1 — INSIDER CLUSTER SCREENING — {today} ===")
-    lines.append(f"Run ID: {run_id} | Tickers Scanned: {tickers_scanned} | Signals Surfaced: {len(signals)}")
+    lines.append(f"=== SIMPLIFIED ENGINE v3.0 — INSIDER CLUSTER SCREENING — {today} ===")
+    lines.append(f"Run ID: {run_id} | Clusters evaluated: {candidates_evaluated} | Signals surfaced: {len(signals)}")
     lines.append("")
     lines.append("STEP-1 SCREENING TOOL. Signals below are candidates for further research")
     lines.append("(fundamentals, news, valuation, sector context) before any trade decision.")
@@ -209,9 +193,9 @@ def _format_report(
     if not signals:
         lines.append("")
         lines.append("NO QUALIFYING CLUSTERS TODAY. THIS IS A VALID RESULT.")
-        lines.append("(Validated cohort historically produces ~1 signal/month.)")
+        lines.append(f"(OpenInsider feed evaluated {candidates_evaluated} cluster candidates; "
+                     f"none passed the mcap + opportunistic filters.)")
     else:
-        # Rank: more opportunistic insiders > more total insiders > higher materiality
         signals.sort(
             key=lambda s: (s.opportunistic_count, s.unique_insiders, s.materiality_pct),
             reverse=True,
@@ -223,14 +207,16 @@ def _format_report(
             )
             liq = " ⚠ THIN LIQUIDITY" if s.liquidity_warning else ""
             disagreement = " ⚡ DISAGREEMENT (high SI + insider buying)" if s.disagreement_flag else ""
-            if s.short_interest_pct is None:
-                si_line = "Short interest: not available"
-            else:
-                si_line = f"Short interest: {s.short_interest_pct:.1f}% of float"
-            if s.analyst_count is None:
-                analyst_line = "Analyst coverage: not available"
-            else:
-                analyst_line = f"Analyst coverage: {s.analyst_count} analyst(s)"
+            si_line = (
+                f"Short interest: {s.short_interest_pct:.1f}% of float"
+                if s.short_interest_pct is not None
+                else "Short interest: not available"
+            )
+            analyst_line = (
+                f"Analyst coverage: {s.analyst_count} analyst(s)"
+                if s.analyst_count is not None
+                else "Analyst coverage: not available"
+            )
             lines.append("")
             lines.append(f"{i}. {s.ticker} — {s.company_name}{disagreement}")
             lines.append(f"   Cluster: {s.unique_insiders} insiders | ${s.total_usd:,.0f} total | {s.materiality_pct:.3f}% of mcap")
@@ -250,22 +236,23 @@ def _format_report(
     lines.append("─" * 70)
     if discarded_log:
         lines.append(f"DISCARDED ({len(discarded_log)}):")
-        for entry in discarded_log[:20]:
+        for entry in discarded_log[:30]:
             lines.append(f"  {entry['ticker']} — {entry['reason']}")
-        if len(discarded_log) > 20:
-            lines.append(f"  ... and {len(discarded_log) - 20} more")
+        if len(discarded_log) > 30:
+            lines.append(f"  ... and {len(discarded_log) - 30} more")
     else:
         lines.append("DISCARDED: none")
     lines.append("")
     lines.append("─" * 70)
     lines.append("REFERENCE")
+    lines.append(f"  Discovery:                  OpenInsider feed (full-market scan)")
     lines.append(f"  Recommended hold:           {RECOMMENDED_HOLD_DAYS} days (Jeng-Metrick-Zeckhauser; Cohen-Malloy-Pomorski)")
     lines.append(f"  Assumed round-trip cost:    {TRANSACTION_COST_PCT}% (retail at $200M–$3B)")
     lines.append(f"  Position size guidance:     max {MAX_RISK_PER_TRADE_PCT}% of equity per signal")
     lines.append(f"  Realistic gross return:     4–8% per 180d trade (median academic estimate)")
     lines.append(f"  Realistic net return:       3–7% per 180d trade after costs")
-    lines.append(f"  Opportunistic flag (CMP):   informational only; do not auto-trade routine clusters")
-    lines.append(f"  ⚡ DISAGREEMENT flag:        short interest {DISAGREEMENT_SI_LOW_PCT:.0f}–{DISAGREEMENT_SI_HIGH_PCT:.0f}% of float (insiders buying into elevated shorts)")
+    lines.append(f"  Opportunistic soft gate:    cluster discarded if 0 opportunistic insiders (CMP 2012)")
+    lines.append(f"  ⚡ DISAGREEMENT flag:        short interest {DISAGREEMENT_SI_LOW_PCT:.0f}–{DISAGREEMENT_SI_HIGH_PCT:.0f}% of float")
     lines.append(f"                              Chung-Sul-Wang 2019. Informational only; not a gate.")
     lines.append("")
     lines.append("DO YOUR OWN RESEARCH ON EACH SURFACED TICKER BEFORE TRADING.")
@@ -281,51 +268,36 @@ def _save_report(report: str, run_id: str) -> Path:
     return path
 
 
-def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
+def main(dry_run: bool = False):
     init_db()
     run_id = str(uuid.uuid4())[:8]
     print(f"\n[Pipeline] Starting run {run_id} {'(DRY RUN)' if dry_run else ''}")
 
-    # Regime — informational only (no gate, no multiplier)
     regime = check_regime()
     print(regime_gate_header(regime))
 
-    # Universe
-    watchlist = build_neglected_universe()
-    if not watchlist:
-        print("[Pipeline] Watchlist empty.")
-        log_run_health(run_id, {"total_candidates": 0, "run_status": "no_universe"})
-        return
-
-    eligible = [w for w in watchlist if MARKET_CAP_MIN_M <= w.get("market_cap_m", 0) <= MARKET_CAP_MAX_M]
-    eligible = eligible[:max_tickers]
-    print(f"[Pipeline] {len(eligible)} tickers in ${MARKET_CAP_MIN_M}M-${MARKET_CAP_MAX_M}M band to scan.")
-
     if dry_run:
-        print(f"[Pipeline] DRY RUN — would scan {len(eligible)} tickers via SEC EDGAR Form 4.")
+        print(f"[Pipeline] DRY RUN — would scrape OpenInsider for last {RECENT_WINDOW_DAYS}d "
+              f"and classify against {HISTORY_DAYS}d history.")
         return
+
+    # Phase 1: full-market discovery via OpenInsider
+    clusters = scan_openinsider(
+        recent_window_days=RECENT_WINDOW_DAYS,
+        history_days=HISTORY_DAYS,
+    )
 
     signals: list[InsiderSignal] = []
     discarded_log: list[dict] = []
 
-    for entry in eligible:
-        ticker = entry["ticker"]
+    # Phase 2: per-cluster enrichment + filtering
+    for cluster in clusters:
+        ticker = cluster.ticker
         blocked, _ = is_deduped(ticker)
         if blocked:
             continue
 
-        try:
-            cluster = scan_insider_buying(ticker, days_back=EDGAR_LOOKBACK_DAYS)
-        except Exception as e:
-            print(f"[Pipeline] {ticker} scan error: {e}")
-            continue
-
-        if not cluster.detected:
-            continue
-
-        # Soft gate: a cluster of all-routine insiders carries near-zero predictive
-        # information per Cohen-Malloy-Pomorski 2012. Filter those out automatically
-        # rather than burden the operator with noise candidates.
+        # Opportunistic soft gate (CMP 2012)
         if cluster.opportunistic_count < 1:
             discarded_log.append({
                 "ticker": ticker,
@@ -335,20 +307,16 @@ def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
 
         enriched = _enrich_ticker(ticker)
         if not enriched:
-            discarded_log.append({"ticker": ticker, "reason": "enrichment_failed"})
+            discarded_log.append({"ticker": ticker, "reason": "yfinance enrichment failed"})
             continue
 
-        # Fresh market-cap re-check (the watchlist cache is up to 7 days stale;
-        # this catches names that drifted outside the $200M-$3B band since cache).
         market_cap_m = enriched.get("market_cap_m", 0)
         if market_cap_m < MARKET_CAP_MIN_M or market_cap_m > MARKET_CAP_MAX_M:
-            discarded_log.append({"ticker": ticker, "reason": f"mcap ${market_cap_m:.0f}M outside ${MARKET_CAP_MIN_M}M-${MARKET_CAP_MAX_M}M"})
+            discarded_log.append({
+                "ticker": ticker,
+                "reason": f"mcap ${market_cap_m:.0f}M outside ${MARKET_CAP_MIN_M}M-${MARKET_CAP_MAX_M}M",
+            })
             continue
-
-        # NOTE: prior v2 had a 0.02%-of-market-cap materiality filter here. Removed in
-        # v2.1: at our 3-insider × $100K = $300K minimum, the 0.02% threshold only binds
-        # above ~$1.5B mcap and was effectively cosmetic across most of the universe.
-        # The $100K × 3 absolute minimum already enforces meaningful commitment.
 
         signal = _build_signal(cluster, enriched)
         signals.append(signal)
@@ -365,14 +333,14 @@ def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
             "regime_gate_pass": int(regime.gate_pass),
         })
 
-    report = _format_report(run_id, regime, signals, len(eligible), discarded_log)
+    report = _format_report(run_id, regime, signals, len(clusters), discarded_log)
     path = _save_report(report, run_id)
     print(report)
     print(f"\n[Pipeline] Report saved to {path}")
 
     log_run_health(run_id, {
         "regime_gate_pass": int(regime.gate_pass),
-        "total_candidates": len(eligible),
+        "total_candidates": len(clusters),
         "final_report_count": len(signals),
         "run_status": "ok",
     })
@@ -380,7 +348,6 @@ def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Show plan without scanning")
-    parser.add_argument("--max-tickers", type=int, default=MAX_TICKERS_TO_SCAN, help="Cap on tickers to scan")
+    parser.add_argument("--dry-run", action="store_true", help="Show plan without scraping")
     args = parser.parse_args()
-    main(dry_run=args.dry_run, max_tickers=args.max_tickers)
+    main(dry_run=args.dry_run)

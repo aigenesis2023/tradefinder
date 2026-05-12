@@ -1,4 +1,4 @@
-# CLAUDE.md — Simplified Engine v2.1 Rulebook
+# CLAUDE.md — Simplified Engine v3.0 Rulebook
 
 This file is normative. Every rule is enforced in Python. There are no LLM agents.
 
@@ -148,22 +148,62 @@ pure market beta. **Do not run this as a sole strategy expecting outperformance.
 
 ---
 
-## Pipeline flow
+## Pipeline flow (v3.0)
 
 ```
 1. RegimeCheck         VIX/VIX3M, IWM vs 20d MA — INFORMATIONAL ONLY
-2. UniverseBuild       yfinance screener, $200M–$3B, cached 7d
-3. InsiderScan         SEC EDGAR Form 4 per ticker (3+ insiders, 30d window, $100K+, P-code)
-4. OpportunisticTag    3-year history check per cluster member, classify each as routine/opp
-5. OpportunisticGate   discard clusters with 0 opportunistic insiders (CMP noise floor)
-6. FreshMcapRecheck    re-fetch market cap via yfinance; discard if drifted outside $200M-$3B
-                       (handles the 7-day watchlist-cache staleness)
-7. Rank                by (opportunistic_count desc, unique_insiders desc, materiality desc)
-8. Report              markdown report + SQLite logging for outcome tracking
+2. OpenInsider Scrape  one HTTP feed call for the last ~3 years; cached per quarter
+3. Filter              role + entity-name filters; ≥$100K per transaction
+4. Cluster Detect      per ticker, find best 30d window with 3+ unique insiders in
+                       the last 45 days. Exactly ONE cluster surfaced per ticker.
+5. OpportunisticTag    routine/opportunistic classification per CMP 2012 using the
+                       same 3-year scraped history
+6. OpportunisticGate   discard clusters with 0 opportunistic insiders
+7. yfinance Enrich     for each surviving cluster: market cap, ADV, short interest,
+                       analyst count, sector
+8. McapFilter          discard if market cap outside $200M-$3B
+9. Rank                by (opportunistic_count desc, unique_insiders desc, materiality desc)
+10. Report             markdown report + SQLite logging for outcome tracking
 ```
 
 No agents. No LLM calls. No multi-step debate. No scoring formula with weights.
-No regime gating. No sizing multipliers. No fixed materiality % filter (was removed in v2.1).
+No regime gating. No sizing multipliers. No fixed materiality % filter.
+
+### v3.0 architecture change
+
+Prior versions (v1–v2.1) used a per-ticker SEC EDGAR scan:
+
+- For each of ~922 tickers in the $200M–$3B band, fetch ~3 years of Form 4 history
+- Estimated runtime: ~25–30 hours on cold cache, every run
+- In practice runs were capped at `--max-tickers N` (default 50), covering ~5% of
+  the universe per run with no rotation — most of the universe was never scanned
+
+v3.0 uses OpenInsider's aggregated feed:
+
+- One scrape returns all qualifying open-market insider purchases across the entire
+  US market for a date range
+- Quarterly chunks are cached locally (1-hour TTL on the current quarter, 1-week TTL
+  on older quarters that are essentially static)
+- Cluster detection runs on the aggregated set
+- yfinance enrichment runs only on the small number of detected candidates
+- Full-market coverage in ~30 seconds on warm cache, ~5 minutes on cold cache
+- The backtest already uses OpenInsider; v3.0 aligns the live pipeline with the
+  validated data path
+
+### Trade-off accepted in v3.0
+
+OpenInsider's scraper filters at source to purchases ≥ $100K (the URL parameter `vl=100`).
+This is the same minimum we use, so cluster detection is unaffected. But for routine /
+opportunistic classification (Cohen-Malloy-Pomorski 2012), an insider's full purchase
+history would ideally include sub-$100K trades too. If an insider habitually buys $50K
+in the same calendar month every year, they're routine by CMP's definition but won't
+appear in our scraped data and will be mis-classified as opportunistic.
+
+This biases conservatively: mis-classifying a routine trader as opportunistic means the
+soft gate (which only blocks clusters with zero opportunistic insiders) does not fire
+inappropriately. The error direction is "we surface a cluster we might have filtered,"
+not "we filter a cluster we should have surfaced." Operator's step-2 research handles
+the residual risk.
 
 ---
 
@@ -282,11 +322,19 @@ the scanner. Foreign-domiciled US-listed names that file Form 4 flow through nor
 
 ---
 
-## Data sources
+## Data sources (v3.0)
 
-- **SEC EDGAR Form 4**: primary signal source (free, 10 req/sec limit, 3-year history per scanned ticker).
-- **yfinance**: market data (market cap, price, ADV, sector).
+- **OpenInsider feed** (http://openinsider.com): primary signal source. Single
+  aggregated feed of SEC Form 4 filings, scraped via HTTP with local quarterly
+  caching. Free, no API key, no published rate limits (we throttle to 0.4s
+  between requests). The same source used by the backtest.
+- **yfinance**: per-cluster enrichment — market cap, price, ADV, sector, short
+  interest, analyst count.
 - **VIX, VIX3M, IWM** (via yfinance): regime context (informational only).
+
+SEC EDGAR is no longer directly scraped in v3.0. OpenInsider aggregates Form 4
+filings from EDGAR, so the underlying authority is the same; the difference is
+the discovery path.
 
 No paid APIs. No LLM. No SAM.gov. No USAspending. No Firecrawl.
 

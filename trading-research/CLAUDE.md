@@ -1,349 +1,210 @@
-# CLAUDE.md — Trading Research Pipeline Rulebook (v3)
+# CLAUDE.md — Simplified Engine v1 Rulebook
 
-This file is normative. Every rule here is enforced in Python. Agent prompts handle judgment only.
-When in doubt, disqualify. The goal of the 60-day paper-trading window is a verified track record, not ideas.
+This file is normative. Every rule is enforced in Python. There are no agent prompts
+in this version.
 
----
+## Philosophy
 
-## DUAL ENTRY GATE
+The 7-year OpenInsider backtest (n=383, of which n=93 met production criteria) is
+the only validated component. Everything else built on top — LLM debate, composite
+scoring weights, government-contract catalysts, neglect screens, confirming signals,
+high-upside scores, theme clustering — was untested additional filtering and has
+been removed.
 
-### Gate 1 — Regime Gate (`orchestrator/regime_gate.py`)
-
-| Condition | Threshold | Pass |
-|---|---|---|
-| VIX/VIX3M ratio | Below 1.0 (contango) | VIX < VIX3M |
-| IWM | Above 20-day MA | IWM > IWM_MA20 |
-
-- **Both pass → NORMAL mode** (full engine activity, ~1–3 trades/week)
-- **Either fails → ELITE-OVERRIDE mode** (engine still runs, but only top-decile signals surface; see below)
-- **Data fetch fails → HARD STOP** (no override possible without data)
-- Log regime state to `regime_history` table on every run.
-
-### Gate 2 — Neglect Screen (`orchestrator/neglect_screen.py`)
-
-Signal-specific rules — see "Neglect Screen rules" below.
+If a feature is not validated against the production cohort, it does not gate
+signal flow. Risk management is allowed without validation (sizing, liquidity
+warnings, dedup) because it never blocks a signal — only shrinks position size.
 
 ---
 
-## ELITE-OVERRIDE MODE (new in v3)
+## THE SIGNAL (only one)
 
-When the regime gate fails, the engine does NOT terminate. It runs in elite-only mode with stricter thresholds. Surviving candidates are tagged `regime_override=True` and capped at Medium confidence.
+Open-market insider buying cluster, defined by:
 
-| Signal | Normal mode | Elite-Override mode |
-|---|---|---|
-| Insider cluster | 3+ insiders, 0.02% materiality, ≥$100K each | **5+ insiders, $2M+ total, 0.10% materiality** |
-| Government contract | 10%+ of TTM revenue | **≥25% of TTM revenue** |
-
-**Rationale:** Some of the highest-asymmetric trades occur during panics. The old hard-terminate gate threw those away. Elite thresholds keep the safety profile while letting genuinely exceptional signals through.
-
----
-
-## DOMICILE
-
-No country filter. Form 4 is the bottleneck: only SEC-registered Section 16 filers reach the scanner, and the 7-year backtest cohort (n=383) included foreign-domiciled issuers that filed Form 4 (Australian/European names appear in `backtest/cache/form4_xml/`). Removing the prior hard `country == US` filter (removed v3.1, 2026-05-11) realigns the live engine with the validated cohort. Foreign-domiciled US-listed names (e.g. SRAD on NASDAQ) flow through normally; real risks (thin ADV, primary-exchange-in-other-timezone gap noise) are caught by `liquidity_warning` and `data_quality_score` flags, not by domicile.
-
----
-
-## MARKET CAP FILTER
-
-| Range | Treatment |
+| Condition | Threshold |
 |---|---|
-| $200M–$5B | Primary universe |
-| $100M–$200M | Probationary — set `liquidity_warning = True` |
-| Below $100M | Discard and log |
+| Unique insiders | ≥ 3 |
+| Per-transaction minimum | ≥ $100,000 |
+| Cluster window | ≤ 14 days |
+| Look-back window | 21 days |
+| Qualifying roles | CEO, CFO, COO, Chairman, Director, President, EVP, SVP |
+| Transaction code | "P" (open-market purchase only) |
+| 10b5-1 plan trades | Excluded |
+| Institutional entity names | Excluded (LLC, LP, Fund, Trust, etc.) |
+| Market cap | $500M – $5B |
+| Cluster materiality | ≥ 0.02% of market cap |
 
-- Hard cap: 15 candidates into debate layer per run.
-- Max 50% of those 15 may be probationary.
-- **Insider scan is restricted to $500M–$5B only** (empirical: 3+ insiders in $200M–$500M = −0.87% alpha).
-
----
-
-## CATALYST PRIORITY
-
-| Catalyst Type | Status | Prior |
-|---|---|---|
-| `government_contract_award` | PRIMARY | 1.0x |
-| `insider_buying_cluster` | PRIMARY (empirically validated) | 0.85x |
-| `neglected_firm_pre_coverage` | Secondary | 0.9x |
-| Others | PARKED post Day 60 | — |
-
-### Insider cluster definition (`orchestrator/insider_scanner.py`)
-
-- **3+** unique insiders, each ≥$100K open-market purchase (Form 4 code "P"), within a 14-day window. Scanned 21 days back (tightened from 45 days in v3 — empirical alpha lives within ~15 days of cluster_end; older signals were getting decayed out anyway and consuming pipeline budget).
-- Qualifying roles: CEO, CFO, COO, Chairman, Director, President, EVP, SVP.
-- Institutional entity names filtered (LLC, LP, fund, etc.).
-- 10b5-1 plan transactions excluded.
-- Cluster total ≥ 0.02% of market cap (materiality floor).
-
-### Government contract rules (`orchestrator/contract_scanner.py`)
-
-- USAspending API, $500K minimum, 90-day window.
-- Contract <10% of TTM revenue: auto-cap at Speculative (applies ONLY to contract catalysts, fixed in v3 — was incorrectly capping insider clusters too).
-- Contract `days_since_catalyst > 30`: auto-cap at Speculative (stale).
-- Name matching: ALL significant search words must appear in recipient name (v3 fix; previous logic accepted any single shared word and produced misattributions).
-- When ticker has BOTH contract AND insider cluster: contract is primary, insider added as confirming signal.
-
-### Neglect Screen — Signal-Specific Rules
-
-**Government contracts**: Full 4-condition screen (analyst <8, news <3 events/30d, institutional <30%, volume below 6-mo avg). Hard discard if <2/4 pass.
-- `heldPercentInstitutions > 100%` is treated as a yfinance data artifact (short-loan double-count) and discarded as missing data.
-
-**Insider clusters**: Only analyst-count and news-count conditions apply.
-- Institutional ownership EXCLUDED (index funds alone occupy 15–20% of float at $500M–$5B).
-- Volume ratio EXCLUDED (insider buying itself causes the spike — circular check).
-- Hard discard only if `analyst_count >= 10 AND news_count_30d >= 5` (market already aware).
+These are the exact filters that produced the validated n=93 cohort.
 
 ### Empirical priors (LOCKED — do not tune without similarly-scaled validation)
 
-7-year backtest (n=383, OpenInsider 2018–2024):
-- 3+ insiders outperform 2 (30d: 59.5% win / +2.80% vs 50.6% / +0.63%).
-- Mid-cap ($500M–$5B) > micro-cap on every window.
-- Regime decisive (2019: +5.09% / 72% win; 2022: −5.17% / 40% win).
-- Raw mechanical baseline: 53.4% win / +1.31% at 30d.
-- Production cohort (3+, $500M–$5B, n=93): +3.92% IWM-adjusted alpha at 30d.
+Production cohort (3+ insiders, $500M–$5B, 2018–2024, n=93):
+- 10d IWM-adjusted alpha: +2.93% (per-day 0.293%) — chosen horizon
+- 30d IWM-adjusted alpha: +3.92%
+- 60d IWM-adjusted alpha: +7.82% (ex-COVID, n=78)
+- 30d alpha win rate: 68.8%
+- Mean reversion sets in by day 180 (do not hold indefinitely)
 
-### Holding-horizon priors (added v3, same cohort)
+Elite sub-cohort (5+ insiders, n=7):
+- Peaks at +6.68% by day 10
+- Mean-reverts to +0.05% by day 30
 
-Per-day alpha analysis on n=93 production:
-- 7d: +1.32% / per-day 0.188% / alpha-std 0.136
-- **10d: +2.93% / per-day 0.293% / alpha-std 0.235** ← optimal
-- 30d: +3.92% / per-day 0.131% / alpha-std 0.227
-
-Elite cohort (5+ insiders, n=7): peaks at +6.68% by day 10, mean-reverts to +0.05% by day 30.
-
-**Decision: 10-day expected holding horizon.** Best per-day alpha and best risk-adjusted return.
+Anti-priors (DO NOT remove these guards):
+- 3+ insiders in $200M–$500M: −0.87% alpha (negative; excluded by mcap floor)
+- 2-insider clusters: noise (excluded by min cluster size)
 
 ---
 
-## SCORING FORMULAS
+## REGIME (informational + sizing multiplier, NOT a gate)
 
-### Information Asymmetry Score
+The 7-year backtest cohort was unconditional on regime. We surface regime state
+and use it as a position-size multiplier. We do **not** suppress signals on regime.
 
-```
-information_asymmetry_score =
-    (recency_vs_lag          * 0.30) +
-    (coverage_gap            * 0.40) +
-    (narrative_inconsistency * 0.30)
-```
-Coverage gap scale: ≤3 analysts = 5, 4–5 = 4, 6–8 = 3, >8 = `max(2.0, 3.0 − (analyst_count − 8) × 0.3)`.
-
-**Floor at 2.0** (v3.1, 2026-05-11): without a floor the >8-analyst decay zeroes out coverage_gap entirely at ~18 analysts and mathematically caps info_asymmetry at 3.0 max, making the HC 3.5 threshold unreachable for any well-covered name. The backtest cohort had no info_asymmetry filter at all; flooring at 2.0 still penalises coverage but does not unconditionally exclude.
-
-**Drawdown boost** (v3.1, 2026-05-11): if `price / fiftyTwoWeekHigh < 0.70`, add +1.0 to coverage_score (capped at 5.0). Heavy coverage with the stock deep in drawdown is a sentiment-dislocation pattern (bullish analyst targets + bearish tape + insider buying), not "priced-in." This is a deliberate departure from a pure analyst-count proxy and worth shadow-validating during paper trading.
-
-| Score | Treatment |
-|---|---|
-| < 1.5 | Discard |
-| 1.5–2.5 | Probationary |
-| < 2.0 | Cap confidence at Speculative |
-| ≥ 3.5 | Required for High Conviction |
-
-### Composite Score
-
-```
-composite = (
-    (catalyst_strength × catalyst_type_prior × 0.30) +
-    (quant_confirmation                       × 0.30) +
-    (risk_asymmetry                           × 0.25) +
-    (information_asymmetry                    × 0.15)
-) × (data_quality / 5)
-+ confirming_signal_bonus  (capped at +0.9)
-```
-
-- All four component scores are **deterministic Python** (no LLM):
-  - `catalyst_strength`: insider cluster size (3→3.4, 4→3.8, 5→4.2, 6+→4.5) + materiality bonus (≥0.1% +0.15, ≥0.2% +0.3). Contract: revenue tiers (10%→3.0, 15%→3.5, 25%→4.0, 50%+→4.5).
-  - `quant_confirmation`: deterministic VSA + RS scoring in `agent2_quant.py` (v3 fix — was LLM-driven previously despite claim otherwise).
-  - `risk_asymmetry`: RS vs IWM ±0.4, quant ≥3.5 +0.3, **short interest >20% +0.4** (raised from +0.2 in v3), fresh signal ≤5d +0.3.
-  - `information_asymmetry`: from Agent 1 (analyst coverage 40%, recency 30%, narrative gap 30%). LLM provides the narrative_inconsistency input only.
-- LLM (Agent 3) used only for narrative output: thesis, invalidation_trigger, daily_monitors, marginal_buyer_analysis.
-
-### Confirming-signal bonus (v3: no double-count)
-
-If a confirming signal matches the PRIMARY catalyst type (e.g. insider cluster as both primary and confirming), the matching signal is stripped before computing bonus. Was double-counting in v2.
-
-### Signal pools (v3)
-
-| Pool | Composite floor | Upside score floor | Cap |
-|---|---|---|---|
-| High Conviction | ≥ 3.5 | — | 5 ideas |
-| High Upside (new) | ≥ 3.0 | ≥ 2.5 | 3 ideas |
-
-### High-Upside score (new in v3, deterministic 0–5)
-
-- Short interest >20% → +1.5 (squeeze fuel)
-- Insider cluster ≥0.20% of market cap → +1.0; ≥0.10% → +0.5
-- 5+ unique insiders → +1.0
-- Contract ≥50% of TTM revenue → +2.0; 25–50% → +1.0
-- Smaller mid-cap ($500M–$1.5B) → +0.5
-
----
-
-## MULTI-SIGNAL CONFIRMATION
-
-Each confirming signal adds +0.3, capped at +0.9. Confirming signals do NOT substitute for a primary catalyst. Signal that matches the primary catalyst type is stripped before bonus calculation.
-
-| Signal | Tag |
-|---|---|
-| State/local government contract | `state_government_contract` |
-| SEC Form 4 insider buying cluster | `insider_buying_cluster` |
-| Job posting surge | `hiring_surge` |
-| Specialist fund 13F initiation | `specialist_fund_initiation` |
-| Russell reconstitution candidate | `russell_inclusion_candidate` |
-
-The signal_scanner's internal insider check uses the same 3+ cluster threshold as the primary scanner (v3 fix — was 2 previously).
-
----
-
-## CONFIDENCE LEVEL CAPS
-
-| Condition | Max Confidence |
-|---|---|
-| Probationary | Speculative |
-| `asymmetry_score` < 2.0 | Speculative |
-| `liquidity_warning` = True | Medium |
-| `regime_override` = True | Medium |
-| Neglect screen failed | Cannot be High |
-
-High Conviction definition: composite ≥ 3.5 AND asymmetry ≥ 3.5 AND neglect screen passed AND regime gate passed (not override).
-
----
-
-## ADVERSARIAL AGENT FLOW
-
-| Agent | Role | LLM? |
+| State | Definition | Sizing multiplier |
 |---|---|---|
-| 1 (Bull) | Discovery + thesis | Yes (narrative only) |
-| 1B (Bear) | Pre-mortem failure case | Yes |
-| 1C (Supervisor) | Disqualifies ONLY on a closed list of data/math errors (D1–D5). Defaults to PROCEED. Does NOT disqualify on reputation, litigation, short interest, governance, macro, or qualitative risk — those are priced via the scoring layer. | Yes |
+| NORMAL | VIX/VIX3M < 1.0 AND IWM > 20d MA | 1.0x |
+| STRESSED | Either VIX/VIX3M ≥ 1.0 OR IWM ≤ 20d MA | 0.5x |
+| HARD_FAIL | Regime data fetch failed | 0.0x (no size recommended) |
 
-### Agent 1C — closed disqualification list (v3.1, 2026-05-11)
-
-Earlier prompt used "when in doubt → disqualify," which the LLM generalised to any conflict. Result: 96% disqualification rate over a 4-day audit (27/28 candidates killed, including short-interest signals that are supposed to be POSITIVE per CLAUDE.md). Replaced with a closed list. Disqualification requires the `disqualify_reason` to start with one of:
-
-- **D1**: Specific numerical/factual error in Bull thesis (Bear cites the wrong number)
-- **D2**: Catalyst date or existence proven wrong
-- **D3**: Catalyst already reported by mainstream financial media (WSJ/Bloomberg/Reuters/FT) BEFORE catalyst_date
-- **D4**: Severe data-quality issue preventing catalyst confirmation (delisted, merged, retracted filing)
-- **D5**: Core data fields mutually inconsistent (market cap × shares ≠ price)
-
-All other concerns → PROCEED with `conflict_level` flag. On LLM call failure, defaults to PROCEED with `conflict_level=high` (better to surface flagged than lose silently). LLM client (`orchestrator/llm_client.py`) does one retry on transient failure.
-| 2 (Quant) | Deterministic VSA + RS | **No** (v3) |
-| 3 (Synthesis) | Composite scoring (Python) + narrative (LLM) | LLM narrative only |
-
-Agent 1D (Inversion) and Agent 4 (Devil's Advocate) were removed. Agent 1D file retained for reference; Agent 4 file deleted.
-
----
-
-## VSA / QUANT RULES (deterministic — v3)
-
-Score is computed from 5 VSA proxies + relative strength vs IWM, all in Python:
-- Volume percentile (vs 30d): top quintile +0.6, above-median +0.3, bottom quintile −0.3
-- ATR compression: <0.7 → +0.4 (compression = constructive); >1.3 → −0.2 (expansion)
-- Close position in candle: ≥0.7 → +0.3; ≤0.3 → −0.3
-- Absorption detected (multi-day high-vol flat VWAP): +0.5
-- RS vs IWM: >+2% → +0.4; <−2% → −0.4
-
-Plus hard adjustments:
-- Fewer than 3 of 5 proxies computable: cap at 2.5
-- Sector beta detected (whole sector elevated RVOL): −0.5
-- Short interest >20%: `short_interest_flag = True` (always)
-- $100M–$200M name + ADV <$500K: `liquidity_warning = True`
-
----
-
-## SCORE DECAY (v3: catalyst-specific)
-
-- Insider clusters: full strength to day 21, then 2.5%/day decay. Aligned with 30-day empirical alpha window.
-- Government contracts: full strength to day 7, then 5%/day decay. Reflects faster news-cycle alpha decay.
-
----
-
-## DATA QUALITY AND STALENESS
-
-- OHLCV > 2 trading days stale: `stale_data_flag = True`.
-- Missing data: never discard. Penalise `data_quality_score`.
-- Average `data_quality_score` < 2.0: cap output at Speculative.
-
-Cache TTLs: OHLCV 1 trading day, filings 90 days, contract award 7 days.
-
----
-
-## DEDUP RULES (`state_manager.is_deduped`)
-
-- Same ticker: 14-day cooldown (contracts) / 5-day cooldown (insiders).
-- Same theme cluster: 7 days.
-- Same supply-chain source ticker: 7 days.
-
----
-
-## THEME CLUSTERING (v3: pure deterministic)
-
-- Grouping key: `sector + catalyst_type + supply_chain_source_ticker`
-- Max 2 ideas per theme in final report.
-- The previous N² LLM causal-link check was removed (consumed up to 105 LLM calls per run for 15 candidates; deterministic grouping captures the same intent).
-
----
-
-## API BUDGET (per run — v3)
-
-| Source | Max calls |
-|---|---|
-| LLM agents | 100 (raised from 40) |
-| Market data | 20 |
-| Firecrawl | 15 |
-| SEC EDGAR | 5 |
-| Total | 140 |
-
-LLM raised because v2's 40 was below the floor needed for 15 candidates × ~4 LLM calls each, causing late candidates to be silently disqualified by 1C's budget-exhausted default.
-
----
-
-## RUN-LEVEL KILL CRITERIA
-
-| Condition | Action |
-|---|---|
-| Regime data fetch fails | Hard terminate, no output |
-| Regime gate fails | Enter Elite-Override mode (no longer hard stop) |
-| Avg `data_quality_score` < 2.0 | Speculative labels only |
-| `stale_data_flag` > 50% of candidates | Abort run |
-| > 70% discarded for missing data | Flag low reliability |
-| Agent 1 < 5 candidates | Warn: weak signal environment |
-| Nothing reaches composite ≥ 3.0 + upside qualifying | Empty report (valid) |
-| Agent 1C disqualifies > 80% | Log: high-conflict environment |
-
----
-
-## EXIT RULES (advisory — user executes manually)
-
-The engine surfaces signals; the human trades and manages P&L externally. Recommended exit hierarchy per trade:
-
-1. **Profit target** (~+8% standard, ~+12% high-upside) → take profit
-2. **Stop loss** (~−6% from entry) → cut loss
-3. **Invalidation trigger** (specific event from Agent 3) → exit
-4. **Time stop** → exit if nothing else fired:
-   - Standard signals: **10 trading days**
-   - Elite/HC signals (5+ insiders OR composite ≥ 3.5 + upside score ≥ 3.0): **20 trading days**
-
-Time stop is the catch-all; most trades resolve via 1, 2, or 3.
-
-**Horizon data:** 60 trading-day window shows +7.82% IWM-adj alpha (73% win rate, ex-COVID, n=78), showing strong setups keep running well past 10 days. The 10-day default optimises per-day alpha and capital efficiency. The 20-day extension for elite/HC setups captures the extended run without open-ended holding. 180d shows mean-reversion — do not hold indefinitely.
+Rationale: empirically regime matters (2019: +5.09% / 72% win; 2022: −5.17% / 40% win).
+But a binary gate threw out signals that should be sized down, not skipped. The
+multiplier preserves option to trade while reducing exposure when the macro is hostile.
 
 ---
 
 ## POSITION SIZING (advisory)
 
-- Max risk per trade: 2% of portfolio equity. Position $ = (0.02 × equity) / stop_pct.
-- High Conviction up to 2% risk; Medium 1%; Speculative 0.5%.
-- Position $ also capped at 5% of 20-day ADV (2.5% for liquidity-warning names).
-- Sector soft cap: no more than 50% of active paper-trade positions in one GICS sector.
-- Slippage assumption: 60–80 bps round-trip in the $500M–$5B band.
+Total recommended risk per trade:
+
+```
+recommended_risk_pct = max_risk_per_trade × cluster_size_multiplier × regime_multiplier
+```
+
+| Cluster size | Multiplier |
+|---|---|
+| 3 insiders | 1.0x |
+| 4 insiders | 1.25x |
+| 5+ insiders (ELITE) | 1.5x |
+
+`max_risk_per_trade = 2.0%` of portfolio equity.
+
+Sizing examples:
+- 3 insiders, normal regime: 1.0 × 1.0 × 2% = **2.0% risk**
+- 4 insiders, stressed regime: 1.25 × 0.5 × 2% = **1.25% risk**
+- 5+ insiders (elite), normal regime: 1.5 × 1.0 × 2% = **3.0% risk** (cap at 2%)
+- 3 insiders, hard regime fail: 1.0 × 0.0 × 2% = **0% (skip)**
+
+Liquidity floor: if 20d avg dollar volume < $500K → `liquidity_warning = True` and
+position size additionally capped at 5% of 20-day ADV.
 
 ---
 
-## "NO OPPORTUNITIES" IS A VALID OUTPUT
+## EXIT RULES (advisory)
+
+Recommended exit hierarchy per surfaced signal:
+
+1. **Time stop** (default exit):
+   - Standard clusters (3–4 insiders): **10 trading days**
+   - Elite clusters (5+ insiders): **20 trading days**
+2. **Cut on −6%** from entry (advisory stop loss)
+3. **Trim on +8%** if hit before time stop (advisory profit target)
+4. Manual invalidation if material new info emerges
+
+Source: 10d/20d horizons selected from per-day alpha analysis on n=93 cohort.
+
+---
+
+## DEDUP
+
+- Same ticker: 5-day cooldown (an insider signal that already surfaced does not
+  re-surface every day until a new cluster forms).
+- No theme dedup, no supply-chain dedup (those were artifacts of multi-catalyst
+  v3 design).
+
+---
+
+## ENTRY PRICE (for logging / paper trade tracking)
+
+Entry = next regular-session close after `signal_date` (latest Form 4 filing date
+in the cluster). This matches the backtest convention; the +3.92% alpha is the
+post-filing alpha, not the pre-filing alpha.
+
+---
+
+## RUN-LEVEL OUTPUT
+
+The pipeline produces a daily report with:
+1. Regime state (informational + multiplier).
+2. List of qualifying clusters, ranked by `(unique_insiders, materiality_pct)` desc.
+3. Per signal: ticker, cluster size, total $, materiality %, market cap, ADV,
+   insider names, recommended hold, recommended size, flags.
+4. Discarded log (clusters that detected but failed mcap or materiality).
+
+"No qualifying clusters today" is a valid output. The validated cohort produced
+~1 signal/month on average; many days will be empty.
+
+---
+
+## WHAT IS DELIBERATELY ABSENT
+
+These were present in v3 and removed in Simplified v1. They are not deprecated —
+they are intentionally not built.
+
+| Removed | Why |
+|---|---|
+| Bull / Bear / Supervisor LLM agents | Generated narrative; did not enter scoring; risk of anchoring trader on confabulated thesis. |
+| Composite scoring weights | With one signal type, multi-factor weights have nothing to weight. |
+| Information asymmetry score | Coverage / news / institutional filters were not part of the validated cohort. |
+| Neglect screen | Same — not in validated cohort. |
+| Government contract catalyst | Zero backtest evidence; literature supports the effect for large-caps only. |
+| Confirming signals (hiring, 13F, Russell, state contracts) | Most rely on data we don't have or fire too rarely to move outcomes. |
+| High-Upside score | Re-encodes cluster size + short interest already visible in the surfaced signal. |
+| Theme clustering | At ~1 signal/month, sector/theme overlap is not a practical problem. |
+| Quant scoring (VSA, RS, compression) | Not in validated cohort. Add back only after feature-level backtest. |
+| Elite-override hard gate | Replaced with sizing multiplier — same intent, no signal suppression. |
+
+---
+
+## DOMICILE
+
+No country filter. Form 4 is the bottleneck: only SEC-registered Section 16 filers
+reach the scanner. Foreign-domiciled US-listed names that file Form 4 flow through
+normally (matches the n=383 validated cohort which included foreign issuers).
+
+---
+
+## DATA SOURCES
+
+- **SEC EDGAR Form 4**: primary signal source (free, 10 req/sec limit).
+- **yfinance**: market data (market cap, price, ADV, sector).
+- **VIX, VIX3M, IWM** (via yfinance): regime context.
+
+No paid APIs. No LLM. No SAM.gov. No USAspending. No Firecrawl.
+
+---
+
+## VALIDATION ROADMAP (future, not v1)
+
+Features that may earn their place into v2 only after passing a backtest gate on
+the n=93 cohort (or a refreshed extended cohort):
+
+1. Insider role mix (CEO+CFO+independent director vs three directors).
+2. Cluster velocity (3 buys in 2 days vs 3 in 14).
+3. Purchase price vs 30-day VWAP.
+4. Insider tenure / repeat-cluster history per ticker.
+5. Short interest > 20% as a sizing modifier (academic support; not in cohort).
+6. Single "is catalyst already public?" check (one LLM call per surfaced signal,
+   D3-style — the one LLM use that has defensible signal value).
+
+Each addition must demonstrate a measurable improvement (alpha, win rate, or
+volatility-adjusted return) on the existing cohort before going live.
+
+---
+
+## "NO SIGNAL TODAY" IS A VALID OUTPUT
 
 ```
-NO HIGH CONVICTION IDEAS MET THE 3.5 THRESHOLD TODAY. THIS IS A VALID RESULT.
+NO QUALIFYING CLUSTERS TODAY. THIS IS A VALID RESULT.
 ```
 
 Do not manufacture conviction to fill a report.

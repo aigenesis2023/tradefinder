@@ -1,363 +1,339 @@
 """
-run_pipeline.py — Single entry point for the trading research pipeline.
+run_pipeline.py — Simplified Engine v1
+
+Mechanical insider-cluster scanner. No LLM. No bull/bear debate. No composite scoring.
+No government contracts. No confirming signals. No neglect screen.
+
+The engine surfaces the single signal that the 7-year backtest validated:
+  3+ unique insiders, each >= $100K open-market purchase, within a 14-day window,
+  on a $500M-$5B US-listed company, materiality >= 0.02% of market cap.
+
+Entry price = next close after signal_date (Form 4 filing date).
+Recommended hold = 10 trading days (20 for elite clusters of 5+ insiders).
+Position sizing = cluster-size tier x regime multiplier x risk-per-trade.
+
+Regime state (VIX/VIX3M, IWM vs 20d MA) is REPORTED and used as a SIZING MULTIPLIER.
+It does NOT gate signals — the validated cohort was unconditional on regime.
 
 Usage:
   python run_pipeline.py
   python run_pipeline.py --dry-run
-
-Environment variables:
-  SAM_GOV_API_KEY    — optional. SAM.gov entity detail lookup only (10 req/day limit).
-                       Primary award discovery uses USAspending.gov (no key needed).
-  FIRECRAWL_API_KEY  — optional. For state procurement / job postings.
-
-LLM calls use the claude CLI from your active Claude Code subscription.
-No ANTHROPIC_API_KEY needed. No SAM_GOV_API_KEY needed to run.
 """
 
 import argparse
-import os
 import sys
 import uuid
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from orchestrator.state_manager import init_db, log_candidate, log_run_health, log_regime
-from orchestrator.request_budget import BudgetManager
+import yfinance as yf
+
+from orchestrator.state_manager import init_db, log_candidate, log_run_health
 from orchestrator.regime_gate import check_regime, regime_gate_header
-from orchestrator.signal_scanner import scan_all_signals, compute_signal_bonus
-from orchestrator.theme_cluster import assign_clusters
-from orchestrator.ranking import rank_ideas
-
-from agents.agent1_bull import run_agent1
-from agents.agent1b_bear import run_agent1b
-from agents.agent1c_supervisor import run_agent1c, PROCEED as C_PROCEED
-from agents.agent2_quant import run_agent2
-from agents.agent3_synthesis import run_agent3
+from orchestrator.universe_builder import build_neglected_universe
+from orchestrator.insider_scanner import scan_insider_buying, InsiderCluster
+from orchestrator.state_manager import is_deduped
 
 
-# ── Kill criteria (all enforced in Python) ────────────────────────────────
-KILL_AVG_DATA_QUALITY = 2.0
-KILL_STALE_PCT = 0.50
-KILL_MISSING_DATA_PCT = 0.70
-WARN_MIN_AGENT1_CANDIDATES = 5
-KILL_1C_DISQUALIFY_PCT = 0.80
-COMPOSITE_MIN = 3.5
+# ── Validated thresholds (LOCKED — 7-year backtest n=93) ──────────────────
+MARKET_CAP_MIN_M = 500
+MARKET_CAP_MAX_M = 5000
+MATERIALITY_FLOOR_PCT = 0.02       # cluster total >= 0.02% of market cap
+MIN_DOLLAR_VOLUME = 500_000        # liquidity warning threshold
+DEFAULT_HOLD_DAYS = 10
+ELITE_HOLD_DAYS = 20
+ELITE_CLUSTER_SIZE = 5             # 5+ insiders = elite
+
+# Position sizing tiers (risk-per-trade multiplier)
+CLUSTER_SIZE_MULT = {3: 1.0, 4: 1.25}     # default elite (5+) = 1.5
+ELITE_SIZE_MULT = 1.5
+REGIME_NORMAL_MULT = 1.0
+REGIME_STRESSED_MULT = 0.5
+MAX_RISK_PER_TRADE_PCT = 2.0       # of portfolio equity
+
+# Scan limits
+MAX_TICKERS_TO_SCAN = 500          # universe is already filtered to $500M-$5B via screener
+MAX_REPORT_IDEAS = 10              # surfaced per run
 
 
-def _check_env() -> tuple[str, str | None]:
-    sam_key = os.environ.get("SAM_GOV_API_KEY", "")
-    firecrawl_key = os.environ.get("FIRECRAWL_API_KEY")
-    if not sam_key:
-        print("[Pipeline] SAM_GOV_API_KEY not set — using USAspending.gov only (no key needed).")
-    return sam_key, firecrawl_key
+@dataclass
+class InsiderSignal:
+    ticker: str
+    company_name: str
+    market_cap_m: float
+    signal_date: str               # Form 4 filing date (when we'd have known)
+    cluster_start: str
+    cluster_end: str
+    unique_insiders: int
+    total_usd: float
+    materiality_pct: float
+    avg_daily_dollar_volume: float
+    entry_price_estimate: float    # current price as proxy; actual entry = next close after signal_date
+    insider_names: list = field(default_factory=list)
+    insider_roles: list = field(default_factory=list)
+    liquidity_warning: bool = False
+    recommended_hold_days: int = DEFAULT_HOLD_DAYS
+    cluster_size_multiplier: float = 1.0
+    is_elite: bool = False
+
+
+def _enrich_ticker(ticker: str) -> dict:
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        hist = t.history(period="3mo")
+        market_cap_m = (info.get("marketCap") or 0) / 1e6
+        price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+        avg_volume = float(hist["Volume"].mean()) if not hist.empty else 0
+        avg_dollar_vol = avg_volume * price
+        return {
+            "market_cap_m": round(market_cap_m, 2),
+            "price": round(price, 4),
+            "avg_daily_dollar_volume": round(avg_dollar_vol, 2),
+            "company_name": info.get("longName") or ticker,
+            "sector": info.get("sector") or "",
+        }
+    except Exception:
+        return {}
+
+
+def _days_since(date_str: str) -> int:
+    try:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        return (datetime.utcnow() - dt).days
+    except Exception:
+        return 0
+
+
+def _build_signal(cluster: InsiderCluster, enriched: dict) -> InsiderSignal:
+    market_cap_m = enriched.get("market_cap_m", 0)
+    materiality_pct = (
+        (cluster.total_usd / (market_cap_m * 1e6)) * 100 if market_cap_m > 0 else 0
+    )
+    is_elite = cluster.unique_insiders >= ELITE_CLUSTER_SIZE
+    if is_elite:
+        size_mult = ELITE_SIZE_MULT
+    else:
+        size_mult = CLUSTER_SIZE_MULT.get(cluster.unique_insiders, 1.0)
+
+    return InsiderSignal(
+        ticker=cluster.ticker,
+        company_name=enriched.get("company_name", cluster.ticker),
+        market_cap_m=market_cap_m,
+        signal_date=cluster.cluster_end,
+        cluster_start=cluster.cluster_start,
+        cluster_end=cluster.cluster_end,
+        unique_insiders=cluster.unique_insiders,
+        total_usd=cluster.total_usd,
+        materiality_pct=round(materiality_pct, 4),
+        avg_daily_dollar_volume=enriched.get("avg_daily_dollar_volume", 0),
+        entry_price_estimate=enriched.get("price", 0),
+        insider_names=sorted({t.name for t in cluster.transactions}),
+        insider_roles=sorted({t.role for t in cluster.transactions if t.role}),
+        liquidity_warning=enriched.get("avg_daily_dollar_volume", 0) < MIN_DOLLAR_VOLUME,
+        recommended_hold_days=ELITE_HOLD_DAYS if is_elite else DEFAULT_HOLD_DAYS,
+        cluster_size_multiplier=size_mult,
+        is_elite=is_elite,
+    )
+
+
+def _regime_multiplier(regime) -> tuple[float, str]:
+    if regime.gate_pass:
+        return REGIME_NORMAL_MULT, "NORMAL"
+    if regime.vix_value is None:
+        return 0.0, "HARD_FAIL"
+    return REGIME_STRESSED_MULT, "STRESSED"
 
 
 def _format_report(
     run_id: str,
     regime,
-    ranking,
-    disqualified_log: list,
-    budget: BudgetManager,
-    candidates_scanned: int,
-    run_status: str,
+    regime_state: str,
+    regime_mult: float,
+    signals: list,
+    tickers_scanned: int,
+    discarded_log: list,
 ) -> str:
     lines = []
     today = date.today().strftime("%Y-%m-%d")
-
-    lines.append(f"=== TRADING RESEARCH REPORT — {today} ===")
-    budget_summary = budget.to_dict()
-    lines.append(f"Run ID: {run_id} | API Calls: {budget_summary['total_calls']}/{budget_summary['budget']} | Candidates Scanned: {candidates_scanned}")
+    lines.append(f"=== SIMPLIFIED ENGINE v1 — INSIDER CLUSTER REPORT — {today} ===")
+    lines.append(f"Run ID: {run_id} | Tickers Scanned: {tickers_scanned} | Signals Surfaced: {len(signals)}")
     lines.append("")
     lines.append(regime_gate_header(regime))
-    lines.append(f"RUN HEALTH: {run_status.upper()}")
+    lines.append(f"REGIME STATE: {regime_state} | Sizing multiplier: {regime_mult}x")
+    lines.append("(Regime is informational + position-sizing only. It does NOT gate signals.)")
     lines.append("")
-    def _render_idea(idea, label_section):
-        a3 = idea.agent3
-        flags = []
-        if getattr(a3, "regime_override", False):
-            flags.append("REGIME-OVERRIDE")
-        if a3.probationary:
-            flags.append("PROBATIONARY")
-        if a3.liquidity_warning:
-            flags.append("LIQUIDITY WARNING")
-        if a3.short_interest_flag:
-            flags.append("SHORT INTEREST >20%")
-        if a3.stale_data_flag:
-            flags.append("STALE DATA")
-        flag_str = f"  ⚠ {' | '.join(flags)}" if flags else ""
+    lines.append("─" * 60)
+    lines.append("INSIDER CLUSTER SIGNALS")
+    lines.append("─" * 60)
 
-        lines.append(f"{idea.rank}. {a3.ticker} | Score: {a3.composite_score:.2f}/5 | Confidence: {a3.confidence}")
-        lines.append(f"   Catalyst: {a3.catalyst_type} | {a3.days_since_catalyst}d ago")
-        if a3.catalyst_type == "government_contract_award":
-            lines.append(f"   Contract value: {a3.catalyst_strength_score:.1f} catalyst strength")
-        lines.append(f"   Confirming signals: {', '.join(a3.confirming_signals) if a3.confirming_signals else 'none'}")
-        lines.append(f"   Signal bonus: +{a3.signal_bonus:.1f} | Data quality: {a3.data_quality_score:.1f}/5")
-        hold = getattr(a3, "recommended_hold_days", 10)
-        hold_note = " (extended — elite/HC setup)" if hold > 10 else ""
-        lines.append(f"   Hold target: {hold} trading days{hold_note}")
-        if label_section == "high_upside" or a3.high_upside_score >= 2.5:
-            markers = ', '.join(a3.high_upside_markers) if a3.high_upside_markers else 'none'
-            lines.append(f"   Upside score: {a3.high_upside_score:.2f}/5 | Markers: {markers}")
-        if flag_str:
-            lines.append(flag_str)
+    if not signals:
         lines.append("")
-        lines.append(f"   Thesis: {a3.thesis}")
-        lines.append("")
-        lines.append(f"   Invalidation trigger: {a3.invalidation_trigger}")
-        if a3.daily_monitors:
-            lines.append(f"   Watch daily: {' | '.join(a3.daily_monitors)}")
-        lines.append(f"   Marginal buyer: {a3.marginal_buyer_analysis}")
-        lines.append("")
-        if a3.bear_summary:
-            lines.append(f"   ⚠ Bear case: {a3.bear_summary[:300]}...")
-        lines.append("")
-        lines.append("─" * 45)
-
-    lines.append("─" * 45)
-    lines.append("HIGH CONVICTION IDEAS")
-    lines.append("─" * 45)
-    lines.append("")
-
-    if not ranking.included:
-        lines.append("NO HIGH CONVICTION IDEAS MET THE 3.5 THRESHOLD TODAY. THIS IS A VALID RESULT.")
+        lines.append("NO QUALIFYING CLUSTERS TODAY. THIS IS A VALID RESULT.")
+        lines.append("(Validated cohort historically produced ~1 signal/month.)")
     else:
-        for idea in ranking.included:
-            _render_idea(idea, "high_conviction")
-
-    high_upside = getattr(ranking, "high_upside", [])
-    if high_upside:
-        lines.append("")
-        lines.append("─" * 45)
-        lines.append("HIGH-UPSIDE IDEAS  (composite 3.0-3.5, strong asymmetric markers — size smaller)")
-        lines.append("─" * 45)
-        lines.append("")
-        for idea in high_upside:
-            _render_idea(idea, "high_upside")
+        signals.sort(key=lambda s: (s.unique_insiders, s.materiality_pct), reverse=True)
+        for i, s in enumerate(signals[:MAX_REPORT_IDEAS], start=1):
+            total_size_mult = round(s.cluster_size_multiplier * regime_mult, 3)
+            recommended_risk_pct = round(MAX_RISK_PER_TRADE_PCT * total_size_mult, 3)
+            flags = []
+            if s.is_elite:
+                flags.append("ELITE 5+ INSIDERS")
+            if s.liquidity_warning:
+                flags.append("LIQUIDITY WARNING")
+            flag_str = f"  ⚠ {' | '.join(flags)}" if flags else ""
+            lines.append("")
+            lines.append(f"{i}. {s.ticker} — {s.company_name}")
+            lines.append(f"   Cluster: {s.unique_insiders} insiders | ${s.total_usd:,.0f} total | {s.materiality_pct:.3f}% of mcap")
+            lines.append(f"   Market cap: ${s.market_cap_m:,.0f}M | ADV: ${s.avg_daily_dollar_volume:,.0f}")
+            lines.append(f"   Cluster window: {s.cluster_start} to {s.cluster_end} | Signal date: {s.signal_date}")
+            lines.append(f"   Insiders: {', '.join(s.insider_names)}")
+            if s.insider_roles:
+                lines.append(f"   Roles: {', '.join(s.insider_roles)}")
+            lines.append(f"   Entry: next close after {s.signal_date} (current ~${s.entry_price_estimate:.2f})")
+            lines.append(f"   Hold: {s.recommended_hold_days} trading days")
+            lines.append(f"   Sizing: cluster {s.cluster_size_multiplier}x × regime {regime_mult}x = {total_size_mult}x")
+            lines.append(f"          (recommended risk: {recommended_risk_pct:.2f}% of equity, max {MAX_RISK_PER_TRADE_PCT}%)")
+            if flag_str:
+                lines.append(flag_str)
 
     lines.append("")
-    lines.append("DISQUALIFIED TODAY")
-    lines.append("─" * 45)
-    if disqualified_log:
-        for entry in disqualified_log:
+    lines.append("─" * 60)
+    if discarded_log:
+        lines.append(f"DISCARDED ({len(discarded_log)}):")
+        for entry in discarded_log[:20]:
             lines.append(f"  {entry['ticker']} — {entry['reason']}")
+        if len(discarded_log) > 20:
+            lines.append(f"  ... and {len(discarded_log) - 20} more")
     else:
-        lines.append("  None")
-
-    if ranking.clustered_out:
-        lines.append("")
-        lines.append("CLUSTERED OUT (same theme, scored lower):")
-        for r in ranking.clustered_out:
-            lines.append(f"  {r.ticker} | Score: {r.composite_score:.2f} | Theme cap applied")
-
+        lines.append("DISCARDED: none")
     lines.append("")
-    lines.append(budget.summary())
-
+    lines.append("─" * 60)
+    lines.append("EXIT RULES (advisory — user executes manually):")
+    lines.append("  1. Time stop at recommended hold (10d standard / 20d elite)")
+    lines.append("  2. Cut on -6% from entry (advisory stop)")
+    lines.append("  3. Trim on +8% if hit before time stop (advisory target)")
+    lines.append("Validation source: 7-year OpenInsider backtest, n=93 production cohort.")
     return "\n".join(lines)
 
 
-def main(dry_run: bool = False):
-    init_db()
-
-    sam_key, firecrawl_key = _check_env()
-    budget = BudgetManager(dry_run=dry_run)
-    run_id = str(uuid.uuid4())[:8]
-    disqualified_log = []
-    run_status = "ok"
-
-    print(f"\n[Pipeline] Starting run {run_id} {'(DRY RUN)' if dry_run else ''}")
-
-    # ── Gate 1: Regime ────────────────────────────────────────────────────
-    regime = check_regime()
-    # Hard-fail (data fetch error): cannot decide on override mode, terminate.
-    if not regime.gate_pass and not regime.elite_only:
-        print(f"\n{regime_gate_header(regime)}")
-        print("\nREGIME GATE HARD-FAIL — terminating cleanly.")
-        log_run_health(run_id, {
-            "regime_gate_pass": 0,
-            "run_status": "regime_gate_blocked",
-            "api_calls_used": 0,
-        })
-        report = _format_report(run_id, regime, type('R', (), {'included': [], 'high_upside': [], 'clustered_out': []})(),
-                                [], budget, 0, "REGIME GATE HARD-FAIL")
-        _save_report(report, run_id)
-        print(report)
-        return
-
-    if regime.gate_pass:
-        print(f"[Pipeline] Regime gate: PASS")
-    else:
-        print(f"[Pipeline] Regime gate: FAIL → entering ELITE-OVERRIDE mode (only top-decile signals)")
-
-    # ── Agent 1 (Bull): fetch SAM.gov + enrich ────────────────────────────
-    agent1_results = run_agent1(sam_key, budget, firecrawl_key, elite_only=regime.elite_only)
-    candidates_scanned = len(agent1_results)
-
-    if len(agent1_results) < WARN_MIN_AGENT1_CANDIDATES:
-        print(f"[Pipeline] WARNING: only {len(agent1_results)} Agent 1 candidates (weak signal environment)")
-        run_status = "weak_signal"
-
-    if not agent1_results:
-        print("[Pipeline] No Agent 1 candidates. Ending run.")
-        log_run_health(run_id, {"regime_gate_pass": 1, "total_candidates": 0, "run_status": "no_candidates", "api_calls_used": budget._total})
-        report = _format_report(run_id, regime, type('R', (), {'included': [], 'clustered_out': []})(),
-                                [], budget, 0, "NO CANDIDATES")
-        _save_report(report, run_id)
-        print(report)
-        return
-
-    # ── Debate layer: 1B, 1C per candidate ───────────────────────────────
-    agent3_results = []
-    disq_1c = 0
-
-    for a1 in agent1_results:
-        # Market data for bear agent
-        import yfinance as yf
-        try:
-            info = yf.Ticker(a1.ticker).info or {}
-        except Exception:
-            info = {}
-
-        # Agent 1B
-        a1b = run_agent1b(a1, info, budget)
-
-        # Agent 1C
-        a1c = run_agent1c(a1, a1b, budget)
-        if a1c.outcome != C_PROCEED:
-            disq_1c += 1
-            reason = f"Agent 1C: {a1c.disqualify_reason}"
-            disqualified_log.append({"ticker": a1.ticker, "reason": reason})
-            log_candidate(run_id, {"ticker": a1.ticker, "agent1c_resolution": a1c.outcome,
-                                   "discard_reason": reason, "neglect_screen_pass": 1,
-                                   "catalyst_type": a1.catalyst_type})
-            continue
-
-        # Agent 2
-        a2 = run_agent2(a1.ticker, a1.market_cap_m, budget)
-        if a2.stale_data_flag:
-            log_candidate(run_id, {"ticker": a1.ticker, "stale_data_flag": 1})
-
-        # Signal scanner
-        signals = scan_all_signals(
-            a1.ticker, a1.company_name, a1.market_cap_m,
-            a2.rvol or 0, a2.avg_daily_dollar_volume, firecrawl_key
-        )
-        # A confirming signal that matches the primary catalyst is the same evidence
-        # twice — don't grant a bonus for the signal that already drove discovery.
-        primary = a1.catalyst_type
-        if primary in signals.confirming_signals:
-            signals.confirming_signals = [s for s in signals.confirming_signals if s != primary]
-            signals.confirming_signal_count = len(signals.confirming_signals)
-            signals.signal_bonus = compute_signal_bonus(signals.confirming_signal_count)
-
-        # Agent 3 — neglect screen already passed in agent1 for all a1 results
-        a3 = run_agent3(a1, a1b, a1c, a2, signals, True, budget)
-        rejected = a3 is None or (a3 is not None and a3.discard_reason is not None)
-        if rejected:
-            reason = (a3.discard_reason if a3 is not None and a3.discard_reason
-                      else f"Composite below {COMPOSITE_MIN} threshold")
-            disqualified_log.append({"ticker": a1.ticker, "reason": reason})
-
-        if a3 is None:
-            # Shouldn't happen post-refactor, but keep the safety net.
-            log_candidate(run_id, {"ticker": a1.ticker, "discard_reason": reason,
-                                   "catalyst_type": a1.catalyst_type})
-            continue
-
-        if not rejected:
-            agent3_results.append(a3)
-
-        # Log the full score breakdown for BOTH surfaced and rejected candidates.
-        # Rejected candidates have thesis="" and no narrative, but the deterministic
-        # components are populated — that's the data we need to tune the composite floor.
-        log_candidate(run_id, {
-            "ticker": a3.ticker,
-            "composite_score": a3.composite_score,
-            "confidence": a3.confidence,
-            "probationary": int(a3.probationary),
-            "liquidity_warning": int(a3.liquidity_warning),
-            "catalyst_type": a3.catalyst_type,
-            "catalyst_type_prior": a3.catalyst_type_prior,
-            "confirming_signals": a3.confirming_signals,
-            "confirming_signal_count": a3.confirming_signal_count,
-            "insider_buying_cluster": int(signals.insider_buying.detected),
-            "insider_buy_total_usd": signals.insider_buying.total_usd,
-            "hiring_surge_detected": int(signals.hiring_surge.detected),
-            "specialist_fund_initiation": int(signals.specialist_fund.detected),
-            "russell_inclusion_candidate": int(signals.russell_candidate),
-            "neglect_screen_pass": 1,
-            "regime_gate_pass": 1,
-            "agent1b_bear_summary": a1b.bear_summary,
-            "agent1c_resolution": a1c.resolution_summary,
-            "agent1c_conflict_level": a1c.conflict_level,
-            "information_asymmetry_score": a3.information_asymmetry_score,
-            "catalyst_strength_score": a3.catalyst_strength_score,
-            "quant_confirmation_score": a3.quant_confirmation_score,
-            "data_quality_score": a3.data_quality_score,
-            "risk_asymmetry_score": a3.risk_asymmetry_score,
-            "marginal_buyer_score": a3.marginal_buyer_score,
-            "short_interest_flag": int(a3.short_interest_flag),
-            "stale_data_flag": int(a3.stale_data_flag),
-            "sector_beta_flag": int(a3.sector_beta_flag),
-            "rs_vs_iwm": a3.rs_vs_iwm,
-            "proxies_computed": a3.proxies_computed,
-            "thesis": a3.thesis,
-            "invalidation_trigger": a3.invalidation_trigger,
-            "days_since_catalyst": a3.days_since_catalyst,
-            "missing_data_fields": a3.missing_data_fields,
-            "high_upside_score": a3.high_upside_score,
-            "high_upside_markers": a3.high_upside_markers,
-            "regime_override": int(a3.regime_override),
-            "discard_reason": a3.discard_reason or "",
-        })
-
-    # ── Kill criteria checks ──────────────────────────────────────────────
-    if agent1_results:
-        dq_pct = disq_1c / len(agent1_results)
-        if dq_pct > KILL_1C_DISQUALIFY_PCT:
-            print(f"[Pipeline] WARNING: Agent 1C disqualified {dq_pct:.0%} of candidates — high-conflict environment")
-            run_status = "high_conflict"
-
-    # ── Theme clustering + ranking ────────────────────────────────────────
-    if agent3_results:
-        clusters = assign_clusters(agent3_results, budget)
-        ranking = rank_ideas(agent3_results, {}, clusters)
-    else:
-        ranking = type('R', (), {'included': [], 'high_upside': [], 'clustered_out': [], 'total_evaluated': 0})()
-
-    # ── Final report ──────────────────────────────────────────────────────
-    report = _format_report(run_id, regime, ranking, disqualified_log, budget, candidates_scanned, run_status)
-
-    log_run_health(run_id, {
-        "regime_gate_pass": 1,
-        "total_candidates": candidates_scanned,
-        "candidates_passed_neglect": len(agent3_results) + len([d for d in disqualified_log if "Agent 1C" in d["reason"]]),
-        "candidates_disqualified_1c": disq_1c,
-        "final_report_count": len(ranking.included) if hasattr(ranking, 'included') else 0,
-        "api_calls_used": budget._total,
-        "run_status": run_status,
-    })
-
-    _save_report(report, run_id)
-    print(report)
-
-    if dry_run:
-        print("\n" + budget.dry_run_summary())
-
-
-def _save_report(report: str, run_id: str):
+def _save_report(report: str, run_id: str) -> Path:
     logs_dir = Path(__file__).parent / "research_logs"
     logs_dir.mkdir(exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     path = logs_dir / f"report_{ts}_{run_id}.md"
     path.write_text(report)
-    print(f"[Pipeline] Report saved to {path}")
+    return path
+
+
+def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
+    init_db()
+    run_id = str(uuid.uuid4())[:8]
+    print(f"\n[Pipeline] Starting run {run_id} {'(DRY RUN)' if dry_run else ''}")
+
+    # 1. Regime — informational + sizing multiplier
+    regime = check_regime()
+    print(regime_gate_header(regime))
+    regime_mult, regime_state = _regime_multiplier(regime)
+    print(f"[Pipeline] Regime state: {regime_state} | sizing multiplier: {regime_mult}x")
+
+    if regime.vix_value is None:
+        # Hard-fail (data fetch failed). Still scan but cap sizing at 0.
+        print("[Pipeline] Regime data fetch failed. Signals will still surface; recommended size is 0.")
+
+    # 2. Universe
+    watchlist = build_neglected_universe()
+    if not watchlist:
+        print("[Pipeline] Watchlist empty.")
+        log_run_health(run_id, {"total_candidates": 0, "run_status": "no_universe"})
+        return
+
+    # Restrict to validated mcap band ($500M-$5B); the screener pulls $200M+ but
+    # insider alpha is only validated at >= $500M.
+    eligible = [w for w in watchlist if MARKET_CAP_MIN_M <= w.get("market_cap_m", 0) <= MARKET_CAP_MAX_M]
+    eligible = eligible[:max_tickers]
+    print(f"[Pipeline] {len(eligible)} tickers in $500M-$5B band to scan.")
+
+    if dry_run:
+        print(f"[Pipeline] DRY RUN — would scan {len(eligible)} tickers via SEC EDGAR Form 4.")
+        return
+
+    signals: list[InsiderSignal] = []
+    discarded_log: list[dict] = []
+
+    # 3. Scan each ticker for insider clusters
+    for entry in eligible:
+        ticker = entry["ticker"]
+        blocked, dedup_reason = is_deduped(ticker)
+        if blocked:
+            continue
+
+        try:
+            cluster = scan_insider_buying(ticker, days_back=21)
+        except Exception as e:
+            print(f"[Pipeline] {ticker} scan error: {e}")
+            continue
+
+        if not cluster.detected:
+            continue
+
+        # Materiality + market cap re-check via fresh enrichment
+        enriched = _enrich_ticker(ticker)
+        if not enriched:
+            discarded_log.append({"ticker": ticker, "reason": "enrichment_failed"})
+            continue
+
+        market_cap_m = enriched.get("market_cap_m", 0)
+        if market_cap_m < MARKET_CAP_MIN_M or market_cap_m > MARKET_CAP_MAX_M:
+            discarded_log.append({"ticker": ticker, "reason": f"mcap ${market_cap_m:.0f}M outside $500M-$5B"})
+            continue
+
+        if market_cap_m > 0:
+            materiality_pct = (cluster.total_usd / (market_cap_m * 1e6)) * 100
+            if materiality_pct < MATERIALITY_FLOOR_PCT:
+                discarded_log.append({
+                    "ticker": ticker,
+                    "reason": f"materiality {materiality_pct:.4f}% below {MATERIALITY_FLOOR_PCT}% floor",
+                })
+                continue
+
+        signal = _build_signal(cluster, enriched)
+        signals.append(signal)
+
+        log_candidate(run_id, {
+            "ticker": signal.ticker,
+            "catalyst_type": "insider_buying_cluster",
+            "catalyst_date": signal.signal_date,
+            "days_since_catalyst": _days_since(signal.signal_date),
+            "insider_buying_cluster": 1,
+            "insider_buy_total_usd": signal.total_usd,
+            "insider_buy_names": signal.insider_names,
+            "liquidity_warning": int(signal.liquidity_warning),
+            "regime_gate_pass": int(regime.gate_pass),
+        })
+
+    # 4. Report
+    report = _format_report(
+        run_id, regime, regime_state, regime_mult, signals, len(eligible), discarded_log,
+    )
+    path = _save_report(report, run_id)
+    print(report)
+    print(f"\n[Pipeline] Report saved to {path}")
+
+    log_run_health(run_id, {
+        "regime_gate_pass": int(regime.gate_pass),
+        "total_candidates": len(eligible),
+        "final_report_count": len(signals),
+        "run_status": "ok",
+    })
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Estimate API calls without executing")
+    parser.add_argument("--dry-run", action="store_true", help="Show plan without scanning")
+    parser.add_argument("--max-tickers", type=int, default=MAX_TICKERS_TO_SCAN, help="Cap on tickers to scan")
     args = parser.parse_args()
-    main(dry_run=args.dry_run)
+    main(dry_run=args.dry_run, max_tickers=args.max_tickers)

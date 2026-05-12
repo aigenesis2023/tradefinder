@@ -91,6 +91,26 @@ reported when unavailable.
 
 ---
 
+## Analyst coverage count (informational only)
+
+Per Lakonishok-Lee (2001) and follow-up studies: insider-buying alpha is stronger
+in stocks with lower analyst coverage (information asymmetry is higher when fewer
+Wall Street analysts cover the name). The engine fetches `numberOfAnalystOpinions`
+from yfinance and surfaces it on each signal alongside short interest.
+
+**Not a gate.** Lower analyst count is generally a positive contextual marker for
+the insider-cluster signal, but the engine does not filter on it. The operator
+uses it during step-2 discretionary research to assess whether a candidate is
+genuinely under-researched (~5 or fewer analysts) or a small-cap name that is
+already well-followed.
+
+The $200M–$3B market-cap band already biases the universe toward lower coverage,
+so this field often shows single-digit counts. When it shows 15–20+ analysts,
+the candidate is a well-followed small-cap and the information edge per the
+literature is likely smaller.
+
+---
+
 ## Empirical expectation (what to actually anticipate)
 
 Reasonable median estimates from post-2010 US literature for our exact configuration:

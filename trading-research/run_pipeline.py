@@ -85,6 +85,7 @@ class InsiderSignal:
     entry_price_estimate: float
     short_interest_pct: float | None = None    # % of float; None when data missing
     disagreement_flag: bool = False             # True when SI within DISAGREEMENT band
+    analyst_count: int | None = None            # # of sell-side analysts covering (yfinance)
     insider_names: list = field(default_factory=list)
     insider_roles: list = field(default_factory=list)
     liquidity_warning: bool = False
@@ -109,6 +110,12 @@ def _enrich_ticker(ticker: str) -> dict:
             round(float(si_raw) * 100, 2) if si_raw is not None and si_raw > 0 else None
         )
 
+        # Analyst coverage count — proxy for institutional attention. Lower = more
+        # under-researched = literature suggests stronger insider-trade alpha.
+        # Informational only; not a gate.
+        analyst_raw = info.get("numberOfAnalystOpinions")
+        analyst_count = int(analyst_raw) if analyst_raw is not None else None
+
         return {
             "market_cap_m": round(market_cap_m, 2),
             "price": round(price, 4),
@@ -116,6 +123,7 @@ def _enrich_ticker(ticker: str) -> dict:
             "company_name": info.get("longName") or ticker,
             "sector": info.get("sector") or "",
             "short_interest_pct": short_interest_pct,
+            "analyst_count": analyst_count,
         }
     except Exception:
         return {}
@@ -155,6 +163,7 @@ def _build_signal(cluster: InsiderCluster, enriched: dict) -> InsiderSignal:
         entry_price_estimate=enriched.get("price", 0),
         short_interest_pct=si_pct,
         disagreement_flag=disagreement_flag,
+        analyst_count=enriched.get("analyst_count"),
         insider_names=sorted({t.name for t in cluster.transactions}),
         insider_roles=sorted({t.role for t in cluster.transactions if t.role}),
         liquidity_warning=enriched.get("avg_daily_dollar_volume", 0) < MIN_DOLLAR_VOLUME,
@@ -205,6 +214,10 @@ def _format_report(
                 si_line = "Short interest: not available"
             else:
                 si_line = f"Short interest: {s.short_interest_pct:.1f}% of float"
+            if s.analyst_count is None:
+                analyst_line = "Analyst coverage: not available"
+            else:
+                analyst_line = f"Analyst coverage: {s.analyst_count} analyst(s)"
             lines.append("")
             lines.append(f"{i}. {s.ticker} — {s.company_name}{disagreement}")
             lines.append(f"   Cluster: {s.unique_insiders} insiders | ${s.total_usd:,.0f} total | {s.materiality_pct:.3f}% of mcap")
@@ -212,7 +225,7 @@ def _format_report(
             if s.routine_insiders:
                 lines.append(f"   Routine traders (low signal value): {', '.join(s.routine_insiders)}")
             lines.append(f"   Market cap: ${s.market_cap_m:,.0f}M | ADV: ${s.avg_daily_dollar_volume:,.0f}")
-            lines.append(f"   {si_line}")
+            lines.append(f"   {si_line} | {analyst_line}")
             lines.append(f"   Cluster window: {s.cluster_start} → {s.cluster_end} | Signal date: {s.signal_date}")
             lines.append(f"   Insiders: {', '.join(s.insider_names)}")
             if s.insider_roles:

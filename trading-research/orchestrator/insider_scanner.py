@@ -79,6 +79,8 @@ class InsiderCluster:
     cluster_end: str = ""     # latest transaction date
     total_usd: float = 0.0
     unique_insiders: int = 0
+    opportunistic_count: int = 0   # cluster members not classified as routine (per Cohen-Malloy-Pomorski 2012)
+    routine_insiders: list = field(default_factory=list)   # names of cluster members classified as routine
     notes: str = ""
 
     @property
@@ -260,12 +262,68 @@ def _parse_form4_xml(cik: str, accession: str) -> list[InsiderTransaction]:
     return transactions
 
 
+ROUTINE_LOOKBACK_DAYS = 1100   # ~3 years of history for opportunistic classification
+ROUTINE_PRIOR_YEARS = 3        # Cohen-Malloy-Pomorski 2012: insider is "routine" if they bought
+                               # in the same calendar month for this many consecutive prior years
+
+
+def _classify_routine(
+    cluster_members: set[str],
+    cluster_end_date: str,
+    full_history: list[InsiderTransaction],
+) -> set[str]:
+    """
+    Per Cohen-Malloy-Pomorski (2012, JF): an insider is "routine" if they bought in the
+    same calendar month for ROUTINE_PRIOR_YEARS consecutive prior years.
+    Routine traders' trades have ~0 predictive power; opportunistic traders carry the alpha.
+
+    Returns the SET of names classified as routine. Insiders not in the returned set
+    are opportunistic (the desirable class).
+    """
+    try:
+        end_dt = datetime.strptime(cluster_end_date, "%Y-%m-%d")
+    except ValueError:
+        return set()
+
+    signal_month = end_dt.month
+    signal_year = end_dt.year
+
+    routine: set[str] = set()
+    for name in cluster_members:
+        # Find all this insider's prior open-market buys on this ticker, in prior years only.
+        prior_buys = [
+            t for t in full_history
+            if t.name == name and t.date < cluster_end_date
+        ]
+        # Check whether they bought in the same calendar month in each of the prior N years.
+        months_hit = 0
+        for years_back in range(1, ROUTINE_PRIOR_YEARS + 1):
+            target_year = signal_year - years_back
+            for t in prior_buys:
+                try:
+                    t_dt = datetime.strptime(t.date, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if t_dt.year == target_year and t_dt.month == signal_month:
+                    months_hit += 1
+                    break
+        if months_hit >= ROUTINE_PRIOR_YEARS:
+            routine.add(name)
+
+    return routine
+
+
 def scan_insider_buying(ticker: str, days_back: int = 30) -> InsiderCluster:
     """
     Scan SEC EDGAR for insider buying clusters for a given ticker.
 
     Returns InsiderCluster with detected=True if a qualifying cluster is found,
     i.e. 3+ different insiders made open-market purchases >$100K each within 14 days.
+
+    Also fetches ~3 years of prior Form 4 history for the ticker to classify each cluster
+    member as routine vs opportunistic per Cohen-Malloy-Pomorski (2012). The opportunistic
+    classification is INFORMATIONAL only — the engine surfaces opportunistic_count alongside
+    unique_insiders, but does not gate on it. The discretionary operator decides.
     """
     empty = InsiderCluster(ticker=ticker, detected=False)
 
@@ -275,7 +333,10 @@ def scan_insider_buying(ticker: str, days_back: int = 30) -> InsiderCluster:
         empty.notes = "CIK not found"
         return empty
 
-    accessions = _get_recent_form4_accessions(cik, days_back)
+    # Fetch up to ~3 years of history. The recent window (days_back) is used for cluster
+    # detection; the full history is used only for routine/opportunistic classification.
+    history_days = max(days_back, ROUTINE_LOOKBACK_DAYS)
+    accessions = _get_recent_form4_accessions(cik, history_days)
     if not accessions:
         return empty
 
@@ -291,15 +352,16 @@ def scan_insider_buying(ticker: str, days_back: int = 30) -> InsiderCluster:
     # Sort by date ascending
     all_txns.sort(key=lambda t: t.date)
 
-    # Detect cluster: find any 14-day window with 2+ unique insiders buying
-    best_cluster: list[InsiderTransaction] = []
+    # Cluster detection considers only transactions inside the recent window.
+    recent_cutoff = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    recent_txns = [t for t in all_txns if t.date >= recent_cutoff]
 
-    for i, anchor in enumerate(all_txns):
+    best_cluster: list[InsiderTransaction] = []
+    for anchor in recent_txns:
         window_end = (
             datetime.strptime(anchor.date, "%Y-%m-%d") + timedelta(days=CLUSTER_WINDOW_DAYS)
         ).strftime("%Y-%m-%d")
-
-        window_txns = [t for t in all_txns if anchor.date <= t.date <= window_end]
+        window_txns = [t for t in recent_txns if anchor.date <= t.date <= window_end]
         unique_names = {t.name for t in window_txns}
 
         if len(unique_names) >= MIN_CLUSTER_INSIDERS:
@@ -309,12 +371,21 @@ def scan_insider_buying(ticker: str, days_back: int = 30) -> InsiderCluster:
     if not best_cluster or len({t.name for t in best_cluster}) < MIN_CLUSTER_INSIDERS:
         return empty
 
+    cluster_members = {t.name for t in best_cluster}
+    cluster_end_date = max(t.date for t in best_cluster)
+
+    # Classify each cluster member as routine or opportunistic using full history.
+    routine = _classify_routine(cluster_members, cluster_end_date, all_txns)
+    opportunistic_count = len(cluster_members - routine)
+
     return InsiderCluster(
         ticker=ticker,
         detected=True,
         transactions=best_cluster,
         cluster_start=min(t.date for t in best_cluster),
-        cluster_end=max(t.date for t in best_cluster),
+        cluster_end=cluster_end_date,
         total_usd=sum(t.total_usd for t in best_cluster),
-        unique_insiders=len({t.name for t in best_cluster}),
+        unique_insiders=len(cluster_members),
+        opportunistic_count=opportunistic_count,
+        routine_insiders=sorted(routine),
     )

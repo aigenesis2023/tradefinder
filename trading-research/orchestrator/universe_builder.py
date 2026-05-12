@@ -98,19 +98,17 @@ def _fetch_one_range(
 
 def _fetch_yfinance_tickers(max_batches: int = SCREENER_MAX_BATCHES) -> list[tuple[str, str, float]]:
     """
-    Fetch US-listed tickers across two market cap bands.
+    Fetch US-listed tickers in the $200M–$3B market-cap band (v2 — literature-aligned).
 
-    $500M–$5B: used for both government contract and insider buying signals.
-    $200M–$500M: used for insider buying signals only (government contracts
-                  in agent1 skip tickers below $500M). Insider signals are
-                  proportionally more meaningful at this size — a $250K buy
-                  on a $400M company is 0.06% of market cap (material).
+    Academic evidence (Lakonishok-Lee 2001, Brochet 2010) supports a smaller-is-better
+    relationship for insider-buying signals. The $200M–$3B band captures the small/mid-cap
+    range where information asymmetry is highest while remaining liquid enough for retail.
 
-    Two separate screener queries ensure $200M–$500M companies are captured —
-    a single descending sort hits the $500M+ companies first and may not
-    return enough small-cap results within the batch limit.
+    Two separate screener queries ensure the smaller end is captured — a single descending
+    sort hits the largest companies first and may not return enough small-cap results
+    within the batch limit.
     """
-    large = _fetch_one_range(500_000_000, 5_000_000_000, max_batches, "$500M-$5B")
+    large = _fetch_one_range(500_000_000, 3_000_000_000, max_batches, "$500M-$3B")
     small = _fetch_one_range(200_000_000, 500_000_000, max_batches, "$200M-$500M")
     results = large + small
 

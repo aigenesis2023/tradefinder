@@ -1,210 +1,248 @@
-# CLAUDE.md — Simplified Engine v1 Rulebook
+# CLAUDE.md — Simplified Engine v2 Rulebook
 
-This file is normative. Every rule is enforced in Python. There are no agent prompts
-in this version.
+This file is normative. Every rule is enforced in Python. There are no LLM agents.
 
-## Philosophy
+## What this engine is — and isn't
 
-The 7-year OpenInsider backtest (n=383, of which n=93 met production criteria) is
-the only validated component. Everything else built on top — LLM debate, composite
-scoring weights, government-contract catalysts, neglect screens, confirming signals,
-high-upside scores, theme clustering — was untested additional filtering and has
-been removed.
+**Is**: a daily mechanical scanner that surfaces insider-cluster buying signals on US-listed
+small/mid-cap stocks ($200M–$3B) using SEC Form 4 data. It is a **Step-1 screening tool**:
+it produces a starting list of candidates for the operator's own fundamental research
+(business quality, valuation, news, sector context) before any trade decision.
 
-If a feature is not validated against the production cohort, it does not gate
-signal flow. Risk management is allowed without validation (sizing, liquidity
-warnings, dedup) because it never blocks a signal — only shrinks position size.
-
----
-
-## THE SIGNAL (only one)
-
-Open-market insider buying cluster, defined by:
-
-| Condition | Threshold |
-|---|---|
-| Unique insiders | ≥ 3 |
-| Per-transaction minimum | ≥ $100,000 |
-| Cluster window | ≤ 14 days |
-| Look-back window | 21 days |
-| Qualifying roles | CEO, CFO, COO, Chairman, Director, President, EVP, SVP |
-| Transaction code | "P" (open-market purchase only) |
-| 10b5-1 plan trades | Excluded |
-| Institutional entity names | Excluded (LLC, LP, Fund, Trust, etc.) |
-| Market cap | $500M – $5B |
-| Cluster materiality | ≥ 0.02% of market cap |
-
-These are the exact filters that produced the validated n=93 cohort.
-
-### Empirical priors (LOCKED — do not tune without similarly-scaled validation)
-
-Production cohort (3+ insiders, $500M–$5B, 2018–2024, n=93):
-- 10d IWM-adjusted alpha: +2.93% (per-day 0.293%) — chosen horizon
-- 30d IWM-adjusted alpha: +3.92%
-- 60d IWM-adjusted alpha: +7.82% (ex-COVID, n=78)
-- 30d alpha win rate: 68.8%
-- Mean reversion sets in by day 180 (do not hold indefinitely)
-
-Elite sub-cohort (5+ insiders, n=7):
-- Peaks at +6.68% by day 10
-- Mean-reverts to +0.05% by day 30
-
-Anti-priors (DO NOT remove these guards):
-- 3+ insiders in $200M–$500M: −0.87% alpha (negative; excluded by mcap floor)
-- 2-insider clusters: noise (excluded by min cluster size)
+**Isn't**: a standalone alpha-generating system. Academic literature suggests realistic gross
+returns of ~2–4% per 90-day trade for filtered cluster signals — comparable to passive
+indexing on a risk-adjusted basis after transaction costs and operational overhead. The
+engine's value is the *screen*, not a claimable edge. The discretionary research the
+operator does on each surfaced ticker is where any additional edge is generated.
 
 ---
 
-## REGIME (informational + sizing multiplier, NOT a gate)
+## Parameters (all literature-aligned, see references below)
 
-The 7-year backtest cohort was unconditional on regime. We surface regime state
-and use it as a position-size multiplier. We do **not** suppress signals on regime.
-
-| State | Definition | Sizing multiplier |
+| Parameter | Value | Source |
 |---|---|---|
-| NORMAL | VIX/VIX3M < 1.0 AND IWM > 20d MA | 1.0x |
-| STRESSED | Either VIX/VIX3M ≥ 1.0 OR IWM ≤ 20d MA | 0.5x |
-| HARD_FAIL | Regime data fetch failed | 0.0x (no size recommended) |
-
-Rationale: empirically regime matters (2019: +5.09% / 72% win; 2022: −5.17% / 40% win).
-But a binary gate threw out signals that should be sized down, not skipped. The
-multiplier preserves option to trade while reducing exposure when the macro is hostile.
+| Unique insiders | ≥ 3 within a 14-day window | Lakonishok-Lee 2001; Alldredge-Blank 2019; Kang et al. 2018 |
+| Per-transaction floor | ≥ $100,000 each | Defensible default; literature emphasizes meaningful personal commitment |
+| Cluster window | 14 days | Operationally defensible; literature uses 2d–30d windows |
+| Lookback window | 21 days | Empirical alpha lives within recent cluster activity |
+| Routine/opportunistic check | 3-year history | Cohen-Malloy-Pomorski 2012 |
+| Qualifying roles | CEO, CFO, COO, Chairman, Director, President, EVP, SVP | Standard cohort |
+| Transaction code | "P" (open-market purchase) only | Excludes options/awards/gifts |
+| 10b5-1 plan trades | Excluded | Carry near-zero predictive value |
+| Institutional entity names | Excluded (LLC, LP, Fund, etc.) | Different motives than executive operators |
+| Market cap | $200M–$3B | Smaller-cap effect well-established (Lakonishok-Lee; Jeng et al.) |
+| Materiality | ≥ 0.02% of market cap | Operational filter, no academic basis but defensible |
+| Recommended hold | **90 days** | Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012; Lakonishok-Lee 2001 |
+| Position sizing | Flat: max 2% of equity per trade | No literature support for cluster-size or regime multipliers |
+| Transaction cost assumption | 1.0% round-trip | Realistic for retail at $200M–$3B |
 
 ---
 
-## POSITION SIZING (advisory)
+## The opportunistic-vs-routine flag (informational only)
 
-Total recommended risk per trade:
+Per Cohen-Malloy-Pomorski (2012, *Journal of Finance*): an insider is classified as
+**routine** if they bought in the same calendar month for 3 consecutive prior years.
+Otherwise **opportunistic**. Their finding: opportunistic trades carry ~82bps/month of
+abnormal return; routine trades have ~0 predictive power.
+
+The engine fetches ~3 years of prior Form 4 history for each scanned ticker and computes
+`opportunistic_count` per cluster. This is surfaced in the report alongside `unique_insiders`.
+
+**The engine does NOT gate on opportunistic count.** It is an informational flag for the
+operator to consider during discretionary follow-up. Clusters where all members are
+opportunistic carry higher expected signal value. Clusters dominated by routine traders
+should be weighted accordingly during research.
+
+Rationale for not gating: the engine is a screen, not an edge-extractor. The operator
+applies the second filter (fundamentals, news, valuation) where this flag becomes one
+of several inputs. Hard gating reduces candidate surface for research.
+
+---
+
+## Empirical expectation (what to actually anticipate)
+
+Reasonable median estimates from post-2010 US literature for our exact configuration:
+
+| Metric | Estimate |
+|---|---|
+| Gross return per 90d trade | 2–4% |
+| Net return per 90d trade (after 1% costs) | 1–3% |
+| Annualized (fully deployed, continuous) | ~4–12% net |
+| Comparison: SPY historical annualized | ~10% nominal |
+| Signals per month (expected) | ~1–3 |
+| Win rate per trade (absolute, not alpha) | 55–65% |
+
+The strategy is roughly competitive with passive indexing on standalone return; its value
+is therefore in (a) the discretionary research it enables and (b) diversification from
+pure market beta. **Do not run this as a sole strategy expecting outperformance.**
+
+---
+
+## Pipeline flow
 
 ```
-recommended_risk_pct = max_risk_per_trade × cluster_size_multiplier × regime_multiplier
+1. RegimeCheck      VIX/VIX3M, IWM vs 20d MA — INFORMATIONAL ONLY
+2. UniverseBuild    yfinance screener, $200M–$3B, cached 7d
+3. InsiderScan      SEC EDGAR Form 4 per ticker (3+ insiders, 14d window, $100K+, P-code)
+4. OpportunisticTag 3-year history check per cluster member, classify each as routine/opp
+5. Filter           mcap recheck + materiality floor (0.02% of mcap)
+6. Rank             by (opportunistic_count desc, unique_insiders desc, materiality desc)
+7. Report           markdown report + SQLite logging for outcome tracking
 ```
 
-| Cluster size | Multiplier |
-|---|---|
-| 3 insiders | 1.0x |
-| 4 insiders | 1.25x |
-| 5+ insiders (ELITE) | 1.5x |
-
-`max_risk_per_trade = 2.0%` of portfolio equity.
-
-Sizing examples:
-- 3 insiders, normal regime: 1.0 × 1.0 × 2% = **2.0% risk**
-- 4 insiders, stressed regime: 1.25 × 0.5 × 2% = **1.25% risk**
-- 5+ insiders (elite), normal regime: 1.5 × 1.0 × 2% = **3.0% risk** (cap at 2%)
-- 3 insiders, hard regime fail: 1.0 × 0.0 × 2% = **0% (skip)**
-
-Liquidity floor: if 20d avg dollar volume < $500K → `liquidity_warning = True` and
-position size additionally capped at 5% of 20-day ADV.
+No agents. No LLM calls. No multi-step debate. No scoring formula with weights.
+No regime gating. No sizing multipliers.
 
 ---
 
-## EXIT RULES (advisory)
+## Exit framework (advisory — operator executes manually)
 
-Recommended exit hierarchy per surfaced signal:
+1. **Time stop**: 90 trading days. Single horizon for all signals.
+2. **Hard stop**: −15% from entry (loose, to handle 90d variance — tight stops kick out winners early at this horizon).
+3. **Soft target**: +15% if hit before time stop. Discretionary trim/exit.
+4. **Manual invalidation**: material new info (earnings miss, fraud, regulatory action) — exit immediately.
 
-1. **Time stop** (default exit):
-   - Standard clusters (3–4 insiders): **10 trading days**
-   - Elite clusters (5+ insiders): **20 trading days**
-2. **Cut on −6%** from entry (advisory stop loss)
-3. **Trim on +8%** if hit before time stop (advisory profit target)
-4. Manual invalidation if material new info emerges
-
-Source: 10d/20d horizons selected from per-day alpha analysis on n=93 cohort.
+The 90-day horizon is chosen because the academic literature consistently shows insider-
+buying alpha accrues over 3–12 months, peaking around 90–180 days. The 10-day and 20-day
+horizons in earlier versions were not literature-supported.
 
 ---
 
-## DEDUP
+## Position sizing (advisory, flat)
 
-- Same ticker: 5-day cooldown (an insider signal that already surfaced does not
-  re-surface every day until a new cluster forms).
-- No theme dedup, no supply-chain dedup (those were artifacts of multi-catalyst
-  v3 design).
+- Max risk per trade: **2.0% of portfolio equity**. Position $ = (0.02 × equity) / stop_pct.
+- Liquidity floor: if 20d ADV < $500K → `liquidity_warning`, additionally cap position at 5% of ADV.
+- No cluster-size multipliers. No regime multipliers. No elite-tier sizing.
 
----
-
-## ENTRY PRICE (for logging / paper trade tracking)
-
-Entry = next regular-session close after `signal_date` (latest Form 4 filing date
-in the cluster). This matches the backtest convention; the +3.92% alpha is the
-post-filing alpha, not the pre-filing alpha.
+Rationale: neither the literature nor our own backtest (n=65 events, statistically too small)
+supports differential sizing on cluster size, market regime, or "elite" extensions. Flat
+sizing is the only defensible default.
 
 ---
 
-## RUN-LEVEL OUTPUT
+## Dedup
 
-The pipeline produces a daily report with:
-1. Regime state (informational + multiplier).
-2. List of qualifying clusters, ranked by `(unique_insiders, materiality_pct)` desc.
-3. Per signal: ticker, cluster size, total $, materiality %, market cap, ADV,
-   insider names, recommended hold, recommended size, flags.
-4. Discarded log (clusters that detected but failed mcap or materiality).
-
-"No qualifying clusters today" is a valid output. The validated cohort produced
-~1 signal/month on average; many days will be empty.
+- Same ticker: 5-day cooldown.
+- No theme dedup, supply-chain dedup, or sector dedup.
 
 ---
 
-## WHAT IS DELIBERATELY ABSENT
+## Regime — informational only
 
-These were present in v3 and removed in Simplified v1. They are not deprecated —
-they are intentionally not built.
+VIX/VIX3M ratio and IWM vs 20d MA are computed and displayed at the top of each report.
+They do not gate signals or modify position size. Rationale:
 
-| Removed | Why |
-|---|---|
-| Bull / Bear / Supervisor LLM agents | Generated narrative; did not enter scoring; risk of anchoring trader on confabulated thesis. |
-| Composite scoring weights | With one signal type, multi-factor weights have nothing to weight. |
-| Information asymmetry score | Coverage / news / institutional filters were not part of the validated cohort. |
-| Neglect screen | Same — not in validated cohort. |
-| Government contract catalyst | Zero backtest evidence; literature supports the effect for large-caps only. |
-| Confirming signals (hiring, 13F, Russell, state contracts) | Most rely on data we don't have or fire too rarely to move outcomes. |
-| High-Upside score | Re-encodes cluster size + short interest already visible in the surfaced signal. |
-| Theme clustering | At ~1 signal/month, sector/theme overlap is not a practical problem. |
-| Quant scoring (VSA, RS, compression) | Not in validated cohort. Add back only after feature-level backtest. |
-| Elite-override hard gate | Replaced with sizing multiplier — same intent, no signal suppression. |
+1. Our n=65 backtest cohort was unconditional on regime; any regime overlay would be
+   untested.
+2. Literature is mixed on regime sensitivity — some studies find stronger effect in
+   bear markets; others find no clean regime split. No consensus on a tractable rule.
+3. Operator can apply regime context in their discretionary research.
 
 ---
 
-## DOMICILE
-
-No country filter. Form 4 is the bottleneck: only SEC-registered Section 16 filers
-reach the scanner. Foreign-domiciled US-listed names that file Form 4 flow through
-normally (matches the n=383 validated cohort which included foreign issuers).
-
----
-
-## DATA SOURCES
-
-- **SEC EDGAR Form 4**: primary signal source (free, 10 req/sec limit).
-- **yfinance**: market data (market cap, price, ADV, sector).
-- **VIX, VIX3M, IWM** (via yfinance): regime context.
-
-No paid APIs. No LLM. No SAM.gov. No USAspending. No Firecrawl.
-
----
-
-## VALIDATION ROADMAP (future, not v1)
-
-Features that may earn their place into v2 only after passing a backtest gate on
-the n=93 cohort (or a refreshed extended cohort):
-
-1. Insider role mix (CEO+CFO+independent director vs three directors).
-2. Cluster velocity (3 buys in 2 days vs 3 in 14).
-3. Purchase price vs 30-day VWAP.
-4. Insider tenure / repeat-cluster history per ticker.
-5. Short interest > 20% as a sizing modifier (academic support; not in cohort).
-6. Single "is catalyst already public?" check (one LLM call per surfaced signal,
-   D3-style — the one LLM use that has defensible signal value).
-
-Each addition must demonstrate a measurable improvement (alpha, win rate, or
-volatility-adjusted return) on the existing cohort before going live.
-
----
-
-## "NO SIGNAL TODAY" IS A VALID OUTPUT
+## "No signal today" is a valid output
 
 ```
 NO QUALIFYING CLUSTERS TODAY. THIS IS A VALID RESULT.
 ```
 
-Do not manufacture conviction to fill a report.
+Do not manufacture conviction to fill a report. The validated cohort produces ~1 signal
+per month on average; many days will be empty.
+
+---
+
+## What was deliberately removed in v2 (and why)
+
+| Removed | Why |
+|---|---|
+| 10-day standard hold + 20-day elite extension | Literature consistently supports 90–180 day horizons. 10d is too short for insider alpha to materialize. |
+| Cluster-size sizing multipliers (1.0/1.25/1.5x) | n=7 elite sub-cohort cannot support a sizing rule. No literature backing. |
+| Regime sizing multiplier (1.0/0.5/0.0x) | Not in validated cohort. Literature is mixed. Pure overlay. |
+| Government contract catalyst | Zero backtest evidence. Removed in v1. |
+| LLM agents (Bull/Bear/Supervisor/Synthesis) | No signal value. Narrative theatre. Removed in v1. |
+| Composite scoring weights | With one signal type, weights have nothing to weight. Removed in v1. |
+| Information asymmetry score, neglect screen | Not in validated cohort. Removed in v1. |
+| Confirming signals (hiring, 13F, Russell) | Most rely on data we don't have or fire too rarely. Removed in v1. |
+| High-Upside score | Re-encoded existing visible information. Removed in v1. |
+| Theme clustering | Not needed at ~1 signal/month. Removed in v1. |
+
+---
+
+## What was added in v2
+
+1. **Opportunistic/routine classification** (Cohen-Malloy-Pomorski 2012) — informational metadata, not a gate.
+2. **90-day hold horizon** (was 10d/20d) — aligned with literature.
+3. **$200M–$3B market cap** (was $500M–$5B) — smaller-cap effect stronger per literature.
+4. **Flat 1.0x sizing** (was cluster-size tiered) — no statistical basis for differentiation.
+5. **Step-1 screening framing** — engine explicitly positioned as research-input, not standalone strategy.
+
+---
+
+## Domicile
+
+No country filter. Form 4 is the bottleneck: only SEC-registered Section 16 filers reach
+the scanner. Foreign-domiciled US-listed names that file Form 4 flow through normally.
+
+---
+
+## Data sources
+
+- **SEC EDGAR Form 4**: primary signal source (free, 10 req/sec limit, 3-year history per scanned ticker).
+- **yfinance**: market data (market cap, price, ADV, sector).
+- **VIX, VIX3M, IWM** (via yfinance): regime context (informational only).
+
+No paid APIs. No LLM. No SAM.gov. No USAspending. No Firecrawl.
+
+---
+
+## Academic references
+
+Engine parameters trace to (where applicable):
+
+- **Lakonishok & Lee (2001)**, "Are Insider Trades Informative?", *Review of Financial Studies*
+- **Jeng, Metrick & Zeckhauser (2003)**, "Estimating the Returns to Insider Trading", *Review of Economics and Statistics*
+- **Cohen, Malloy & Pomorski (2012)**, "Decoding Inside Information", *Journal of Finance*
+- **Brochet (2010)**, on post-SOX information content of insider trades
+- **Wang, Shin & Francis (2012)**, "Are CFOs' Trades More Informative…?", *JFQA*
+- **Alldredge & Blank (2019)**, on insider trade clustering
+- **Kang, Kim & Wang (2018)**, on cluster trade timing post-SOX
+
+The operator should verify these references and read the introductions and key tables
+of at least Cohen-Malloy-Pomorski (2012) and Jeng-Metrick-Zeckhauser (2003) before
+committing capital.
+
+---
+
+## Honest caveats (DO read before operating)
+
+1. **Sample-size limit**: our own backtest cohort is n=65 after dedup. Too small to validate
+   any sub-rule. The engine is calibrated against the broader academic literature, not against
+   our small empirical sample.
+2. **Effect attenuation**: post-Sarbanes-Oxley (2002), the disclosure lag dropped from 40 days
+   to 2 business days. The classical effect is partially priced in faster now. Recent studies
+   (post-2010) find smaller magnitudes than older studies.
+3. **Transaction costs eat thin edges**: at the bottom of the academic range, after 1% costs,
+   net edge approaches zero. Use limit orders; avoid market orders at this market-cap band.
+4. **Right-tail dependence**: a meaningful share of historical alpha comes from a few outsized
+   winners. Most trades will be modest gains or modest losses. Do not over-position any single
+   signal.
+5. **Operator discipline matters more than the screen**: the discretionary research applied
+   after the screen is where most of the realized outcome will come from. Cutting corners on
+   research will produce worse results than not running the engine at all.
+
+---
+
+## Reframe — what success looks like
+
+Success is NOT:
+- Beating SPY by a large margin
+- Producing consistent monthly profits
+- A 60-day paper trade with great numbers
+
+Success IS:
+- A disciplined screening process that surfaces structurally-meaningful events
+- The operator developing fundamental-research skill on the surfaced candidates
+- Multi-year track record of disciplined execution
+- Honest measurement of outcomes vs alternatives (SPY, alternative strategies)
+
+The screen is the engine's contribution. The trade decision is yours.

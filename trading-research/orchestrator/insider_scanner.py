@@ -43,9 +43,11 @@ CIK_CACHE_FILE = CACHE_DIR / "cik_map.json"
 CIK_CACHE_TTL_HOURS = 24
 
 # Cluster thresholds
-MIN_TRANSACTION_USD = 100_000   # per-transaction minimum; cluster materiality (% of mktcap) filters large-cap noise
+MIN_TRANSACTION_USD = 100_000   # per-transaction minimum
 MIN_CLUSTER_INSIDERS = 3
-CLUSTER_WINDOW_DAYS = 14
+CLUSTER_WINDOW_DAYS = 30        # v2.1: extended from 14d — academic studies use 1-3 month
+                                # windows; insider campaigns commonly span weeks. 14d
+                                # artificially split single coordinated campaigns.
 
 # Qualifying roles — exclude rank-and-file employee purchases
 QUALIFYING_ROLES = {

@@ -1,5 +1,5 @@
 """
-run_pipeline.py — Simplified Engine v2 (literature-aligned screening tool)
+run_pipeline.py — Simplified Engine v2.1 (literature-aligned screening tool)
 
 Mechanical insider-cluster scanner. No LLM. No bull/bear debate. No composite scoring.
 No government contracts. No confirming signals. No neglect screen. No sizing multipliers.
@@ -11,17 +11,26 @@ does not claim a standalone edge; it provides a literature-validated starting un
 for discretionary follow-up.
 
 Calibrated against academic literature (see CLAUDE.md):
-  - Cluster definition (3+ insiders, 14-day window, $100K each): Lakonishok-Lee 2001;
+  - Cluster definition (3+ insiders, 30-day window, $100K each): Lakonishok-Lee 2001;
     Alldredge-Blank 2019; Kang et al. 2018.
   - Market cap band $200M–$3B: smaller-is-better consensus across studies.
-  - 90-day hold horizon: Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012;
-    Lakonishok-Lee 2001 (signal accrues over 3–12 months).
-  - Opportunistic vs routine flag: Cohen-Malloy-Pomorski 2012, surfaced as metadata.
+  - 180-day hold horizon: Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012;
+    Lakonishok-Lee 2001 (signal accrues over 3–12 months, peaks ~6 months).
+  - Opportunistic vs routine soft gate: Cohen-Malloy-Pomorski 2012 (≥1 opportunistic
+    insider required; pure-routine clusters carry near-zero predictive content).
   - 10b5-1 exclusion: well-established; routine/scheduled trades carry no signal.
 
-Realistic expectation: 2–4% gross / 1–3% net per 90-day trade (median academic estimate
-for modern post-SOX US small/mid-cap clusters). Comparable to passive indexing on a
-risk-adjusted basis. The engine's value is the SCREEN, not the standalone edge.
+v2.1 changes from v2:
+  - Hold horizon 90 → 180 days (literature peaks ~6mo)
+  - Cluster window 14 → 30 days (academic studies use 1-3 month windows)
+  - EDGAR lookback 21 → 45 days (accommodates wider cluster window)
+  - Removed 0.02% materiality threshold (was redundant with $100K × 3 minimum)
+  - Soft-gate clusters with 0 opportunistic insiders (CMP noise floor)
+
+Realistic expectation: 4–8% gross / 3–7% net per 180-day trade (median academic
+estimate for modern post-SOX US small/mid-cap clusters). Comparable to passive
+indexing on a risk-adjusted basis. The engine's value is the SCREEN, not the
+standalone edge.
 
 Usage:
   python run_pipeline.py
@@ -46,14 +55,18 @@ from orchestrator.universe_builder import build_neglected_universe
 from orchestrator.insider_scanner import scan_insider_buying, InsiderCluster
 
 
-# ── Validated thresholds (literature-aligned, v2) ─────────────────────────
+# ── Validated thresholds (literature-aligned, v2.1) ───────────────────────
 MARKET_CAP_MIN_M = 200             # Lakonishok-Lee, Jeng et al.: smaller-cap stronger
 MARKET_CAP_MAX_M = 3000            # GPT/literature: $500M–$5B too wide; tighten
-MATERIALITY_FLOOR_PCT = 0.02       # operational filter (no academic basis; keep modest)
 MIN_DOLLAR_VOLUME = 500_000        # liquidity-warning threshold
-RECOMMENDED_HOLD_DAYS = 90         # Jeng et al., Cohen-Malloy-Pomorski, Lakonishok-Lee
+RECOMMENDED_HOLD_DAYS = 180        # v2.1: 6-month horizon (Jeng et al., Lakonishok-Lee,
+                                   # Cohen-Malloy-Pomorski). 90d was on the short end of
+                                   # academic guidance; insider-buying alpha builds over
+                                   # 3-12 months and peaks around 6 months.
 TRANSACTION_COST_PCT = 1.0         # realistic round-trip cost assumption for retail $5K–$25K
 MAX_RISK_PER_TRADE_PCT = 2.0       # of portfolio equity (flat, no cluster-size tier)
+EDGAR_LOOKBACK_DAYS = 45           # window for current-cluster detection (3-year history
+                                   # is fetched separately by scanner for routine check)
 
 # Short-interest "disagreement" band (Chung-Sul-Wang 2019, informational only)
 # Insider buying into heavily-shorted-but-not-extreme stocks has shown stronger
@@ -179,7 +192,7 @@ def _format_report(
 ) -> str:
     lines = []
     today = date.today().strftime("%Y-%m-%d")
-    lines.append(f"=== SIMPLIFIED ENGINE v2 — INSIDER CLUSTER SCREENING — {today} ===")
+    lines.append(f"=== SIMPLIFIED ENGINE v2.1 — INSIDER CLUSTER SCREENING — {today} ===")
     lines.append(f"Run ID: {run_id} | Tickers Scanned: {tickers_scanned} | Signals Surfaced: {len(signals)}")
     lines.append("")
     lines.append("STEP-1 SCREENING TOOL. Signals below are candidates for further research")
@@ -249,8 +262,8 @@ def _format_report(
     lines.append(f"  Recommended hold:           {RECOMMENDED_HOLD_DAYS} days (Jeng-Metrick-Zeckhauser; Cohen-Malloy-Pomorski)")
     lines.append(f"  Assumed round-trip cost:    {TRANSACTION_COST_PCT}% (retail at $200M–$3B)")
     lines.append(f"  Position size guidance:     max {MAX_RISK_PER_TRADE_PCT}% of equity per signal")
-    lines.append(f"  Realistic gross return:     2–4% per 90d trade (median academic estimate)")
-    lines.append(f"  Realistic net return:       1–3% per 90d trade after costs")
+    lines.append(f"  Realistic gross return:     4–8% per 180d trade (median academic estimate)")
+    lines.append(f"  Realistic net return:       3–7% per 180d trade after costs")
     lines.append(f"  Opportunistic flag (CMP):   informational only; do not auto-trade routine clusters")
     lines.append(f"  ⚡ DISAGREEMENT flag:        short interest {DISAGREEMENT_SI_LOW_PCT:.0f}–{DISAGREEMENT_SI_HIGH_PCT:.0f}% of float (insiders buying into elevated shorts)")
     lines.append(f"                              Chung-Sul-Wang 2019. Informational only; not a gate.")
@@ -302,7 +315,7 @@ def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
             continue
 
         try:
-            cluster = scan_insider_buying(ticker, days_back=21)
+            cluster = scan_insider_buying(ticker, days_back=EDGAR_LOOKBACK_DAYS)
         except Exception as e:
             print(f"[Pipeline] {ticker} scan error: {e}")
             continue
@@ -310,24 +323,32 @@ def main(dry_run: bool = False, max_tickers: int = MAX_TICKERS_TO_SCAN):
         if not cluster.detected:
             continue
 
+        # Soft gate: a cluster of all-routine insiders carries near-zero predictive
+        # information per Cohen-Malloy-Pomorski 2012. Filter those out automatically
+        # rather than burden the operator with noise candidates.
+        if cluster.opportunistic_count < 1:
+            discarded_log.append({
+                "ticker": ticker,
+                "reason": "all insiders classified routine (no opportunistic signal)",
+            })
+            continue
+
         enriched = _enrich_ticker(ticker)
         if not enriched:
             discarded_log.append({"ticker": ticker, "reason": "enrichment_failed"})
             continue
 
+        # Fresh market-cap re-check (the watchlist cache is up to 7 days stale;
+        # this catches names that drifted outside the $200M-$3B band since cache).
         market_cap_m = enriched.get("market_cap_m", 0)
         if market_cap_m < MARKET_CAP_MIN_M or market_cap_m > MARKET_CAP_MAX_M:
             discarded_log.append({"ticker": ticker, "reason": f"mcap ${market_cap_m:.0f}M outside ${MARKET_CAP_MIN_M}M-${MARKET_CAP_MAX_M}M"})
             continue
 
-        if market_cap_m > 0:
-            materiality_pct = (cluster.total_usd / (market_cap_m * 1e6)) * 100
-            if materiality_pct < MATERIALITY_FLOOR_PCT:
-                discarded_log.append({
-                    "ticker": ticker,
-                    "reason": f"materiality {materiality_pct:.4f}% below {MATERIALITY_FLOOR_PCT}% floor",
-                })
-                continue
+        # NOTE: prior v2 had a 0.02%-of-market-cap materiality filter here. Removed in
+        # v2.1: at our 3-insider × $100K = $300K minimum, the 0.02% threshold only binds
+        # above ~$1.5B mcap and was effectively cosmetic across most of the universe.
+        # The $100K × 3 absolute minimum already enforces meaningful commitment.
 
         signal = _build_signal(cluster, enriched)
         signals.append(signal)

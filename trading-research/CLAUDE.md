@@ -1,4 +1,4 @@
-# CLAUDE.md — Simplified Engine v2 Rulebook
+# CLAUDE.md — Simplified Engine v2.1 Rulebook
 
 This file is normative. Every rule is enforced in Python. There are no LLM agents.
 
@@ -21,24 +21,25 @@ operator does on each surfaced ticker is where any additional edge is generated.
 
 | Parameter | Value | Source |
 |---|---|---|
-| Unique insiders | ≥ 3 within a 14-day window | Lakonishok-Lee 2001; Alldredge-Blank 2019; Kang et al. 2018 |
+| Unique insiders | ≥ 3 within a 30-day window | Lakonishok-Lee 2001; Alldredge-Blank 2019; Kang et al. 2018 |
 | Per-transaction floor | ≥ $100,000 each | Defensible default; literature emphasizes meaningful personal commitment |
-| Cluster window | 14 days | Operationally defensible; literature uses 2d–30d windows |
-| Lookback window | 21 days | Empirical alpha lives within recent cluster activity |
+| Cluster window | **30 days** (v2.1, was 14d) | Academic studies use 1-3 month windows; insider campaigns span weeks |
+| EDGAR lookback (cluster) | **45 days** (v2.1, was 21d) | Accommodates 30d cluster window with buffer for cluster_end recency |
 | Routine/opportunistic check | 3-year history | Cohen-Malloy-Pomorski 2012 |
+| Opportunistic soft gate | **≥1 opportunistic insider required** (v2.1) | Cohen-Malloy-Pomorski 2012: pure-routine clusters carry near-zero predictive content |
 | Qualifying roles | CEO, CFO, COO, Chairman, Director, President, EVP, SVP | Standard cohort |
 | Transaction code | "P" (open-market purchase) only | Excludes options/awards/gifts |
 | 10b5-1 plan trades | Excluded | Carry near-zero predictive value |
 | Institutional entity names | Excluded (LLC, LP, Fund, etc.) | Different motives than executive operators |
 | Market cap | $200M–$3B | Smaller-cap effect well-established (Lakonishok-Lee; Jeng et al.) |
-| Materiality | ≥ 0.02% of market cap | Operational filter, no academic basis but defensible |
-| Recommended hold | **90 days** | Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012; Lakonishok-Lee 2001 |
+| Materiality threshold | **None** (v2.1, was 0.02%) | $100K × 3 = $300K minimum already enforces commitment; 0.02% was mathematically redundant |
+| Recommended hold | **180 days** (v2.1, was 90d) | Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012; Lakonishok-Lee 2001 |
 | Position sizing | Flat: max 2% of equity per trade | No literature support for cluster-size or regime multipliers |
 | Transaction cost assumption | 1.0% round-trip | Realistic for retail at $200M–$3B |
 
 ---
 
-## The opportunistic-vs-routine flag (informational only)
+## The opportunistic-vs-routine flag (v2.1: soft gate + metadata)
 
 Per Cohen-Malloy-Pomorski (2012, *Journal of Finance*): an insider is classified as
 **routine** if they bought in the same calendar month for 3 consecutive prior years.
@@ -46,16 +47,33 @@ Otherwise **opportunistic**. Their finding: opportunistic trades carry ~82bps/mo
 abnormal return; routine trades have ~0 predictive power.
 
 The engine fetches ~3 years of prior Form 4 history for each scanned ticker and computes
-`opportunistic_count` per cluster. This is surfaced in the report alongside `unique_insiders`.
+`opportunistic_count` per cluster, also surfaced in the report alongside `unique_insiders`.
 
-**The engine does NOT gate on opportunistic count.** It is an informational flag for the
-operator to consider during discretionary follow-up. Clusters where all members are
-opportunistic carry higher expected signal value. Clusters dominated by routine traders
-should be weighted accordingly during research.
+**Soft gate (v2.1)**: the engine now discards clusters where `opportunistic_count == 0`
+(i.e., all insiders are classified routine). Rationale: per CMP 2012, a pure-routine
+cluster carries ~0 predictive content. Surfacing these for the operator to research is
+asking them to evaluate definitionally-noisy candidates. The soft gate removes them
+automatically. Clusters with at least 1 opportunistic insider pass through to the report
+with `opportunistic_count / unique_insiders` displayed prominently for operator weighting.
 
-Rationale for not gating: the engine is a screen, not an edge-extractor. The operator
-applies the second filter (fundamentals, news, valuation) where this flag becomes one
-of several inputs. Hard gating reduces candidate surface for research.
+**Why a soft gate and not strict (e.g., "all must be opportunistic")**: requiring all
+cluster members to be opportunistic would significantly reduce candidate volume without
+proportional edge improvement. The CMP finding is "routine trades carry no information";
+not "any routine trader contaminates the cluster signal."
+
+### IPO / new-listing edge case
+
+The 3-year lookback for routine classification requires 3 years of Form 4 history per
+insider. For companies that listed within the last 3 years, no insider can have the
+required history. Per the CMP definition, these insiders are correctly classified as
+**opportunistic by default** (you cannot be routine without a history).
+
+This means freshly-listed companies will tend to show `opportunistic_count == unique_insiders`
+(all opportunistic) regardless of whether the buying behavior is actually informational.
+Operators researching such candidates during step-2 review should be aware that the
+opportunistic flag carries less discriminating information for recent IPOs / spin-offs
+than for mature listings. Treat "100% opportunistic" on a < 3-year-old listing as
+roughly equivalent to "data insufficient to classify."
 
 ---
 
@@ -117,11 +135,11 @@ Reasonable median estimates from post-2010 US literature for our exact configura
 
 | Metric | Estimate |
 |---|---|
-| Gross return per 90d trade | 2–4% |
-| Net return per 90d trade (after 1% costs) | 1–3% |
-| Annualized (fully deployed, continuous) | ~4–12% net |
+| Gross return per 180d trade | 4–8% |
+| Net return per 180d trade (after 1% costs) | 3–7% |
+| Annualized (fully deployed, continuous) | ~6–14% net |
 | Comparison: SPY historical annualized | ~10% nominal |
-| Signals per month (expected) | ~1–3 |
+| Signals per month (expected) | ~2–5 (v2.1 — wider cluster window + materiality removal) |
 | Win rate per trade (absolute, not alpha) | 55–65% |
 
 The strategy is roughly competitive with passive indexing on standalone return; its value
@@ -133,30 +151,34 @@ pure market beta. **Do not run this as a sole strategy expecting outperformance.
 ## Pipeline flow
 
 ```
-1. RegimeCheck      VIX/VIX3M, IWM vs 20d MA — INFORMATIONAL ONLY
-2. UniverseBuild    yfinance screener, $200M–$3B, cached 7d
-3. InsiderScan      SEC EDGAR Form 4 per ticker (3+ insiders, 14d window, $100K+, P-code)
-4. OpportunisticTag 3-year history check per cluster member, classify each as routine/opp
-5. Filter           mcap recheck + materiality floor (0.02% of mcap)
-6. Rank             by (opportunistic_count desc, unique_insiders desc, materiality desc)
-7. Report           markdown report + SQLite logging for outcome tracking
+1. RegimeCheck         VIX/VIX3M, IWM vs 20d MA — INFORMATIONAL ONLY
+2. UniverseBuild       yfinance screener, $200M–$3B, cached 7d
+3. InsiderScan         SEC EDGAR Form 4 per ticker (3+ insiders, 30d window, $100K+, P-code)
+4. OpportunisticTag    3-year history check per cluster member, classify each as routine/opp
+5. OpportunisticGate   discard clusters with 0 opportunistic insiders (CMP noise floor)
+6. FreshMcapRecheck    re-fetch market cap via yfinance; discard if drifted outside $200M-$3B
+                       (handles the 7-day watchlist-cache staleness)
+7. Rank                by (opportunistic_count desc, unique_insiders desc, materiality desc)
+8. Report              markdown report + SQLite logging for outcome tracking
 ```
 
 No agents. No LLM calls. No multi-step debate. No scoring formula with weights.
-No regime gating. No sizing multipliers.
+No regime gating. No sizing multipliers. No fixed materiality % filter (was removed in v2.1).
 
 ---
 
 ## Exit framework (advisory — operator executes manually)
 
-1. **Time stop**: 90 trading days. Single horizon for all signals.
-2. **Hard stop**: −15% from entry (loose, to handle 90d variance — tight stops kick out winners early at this horizon).
-3. **Soft target**: +15% if hit before time stop. Discretionary trim/exit.
+1. **Time stop**: 180 trading days. Single horizon for all signals.
+2. **Hard stop**: −20% from entry (loose, to handle 180d variance — tight stops kick out winners early at this horizon).
+3. **Soft target**: +25% if hit before time stop. Discretionary trim/exit.
 4. **Manual invalidation**: material new info (earnings miss, fraud, regulatory action) — exit immediately.
 
-The 90-day horizon is chosen because the academic literature consistently shows insider-
-buying alpha accrues over 3–12 months, peaking around 90–180 days. The 10-day and 20-day
-horizons in earlier versions were not literature-supported.
+The 180-day horizon is chosen because the academic literature consistently shows
+insider-buying alpha accrues over 3–12 months, peaking around 6 months. Jeng-Metrick-
+Zeckhauser (2003) and Cohen-Malloy-Pomorski (2012) both document significant cumulative
+abnormal returns out through ~12 months. The 10-day, 20-day, and 90-day horizons in
+earlier versions were on the short end of academic guidance.
 
 ---
 
@@ -222,11 +244,34 @@ per month on average; many days will be empty.
 
 ## What was added in v2
 
-1. **Opportunistic/routine classification** (Cohen-Malloy-Pomorski 2012) — informational metadata, not a gate.
+1. **Opportunistic/routine classification** (Cohen-Malloy-Pomorski 2012).
 2. **90-day hold horizon** (was 10d/20d) — aligned with literature.
 3. **$200M–$3B market cap** (was $500M–$5B) — smaller-cap effect stronger per literature.
 4. **Flat 1.0x sizing** (was cluster-size tiered) — no statistical basis for differentiation.
 5. **Step-1 screening framing** — engine explicitly positioned as research-input, not standalone strategy.
+6. **Short interest + DISAGREEMENT flag** (Chung-Sul-Wang 2019) — informational metadata.
+7. **Analyst coverage count** (Lakonishok-Lee 2001) — informational metadata.
+
+## What changed in v2.1 (external review feedback)
+
+1. **Hold horizon 90 → 180 days** — literature peaks ~6mo (Jeng et al. 2003 cumulative
+   abnormal returns through ~14mo; CMP 2012 significant out through 12mo). 90d was on the
+   short end of academic guidance.
+2. **Cluster window 14 → 30 days + EDGAR lookback 21 → 45 days** — academic studies use
+   1–3 month cluster windows; insider campaigns commonly span weeks. 14d was artificially
+   splitting single coordinated campaigns into multiple disjointed events.
+3. **Materiality threshold (0.02%) removed** — was mathematically redundant. At our
+   3-insider × $100K = $300K minimum, the threshold only binds above ~$1.5B market cap.
+   The $100K × 3 absolute floor already enforces meaningful commitment across the band.
+4. **Opportunistic soft gate (≥1 opportunistic insider)** — automatically discard
+   clusters with zero opportunistic insiders. Per CMP 2012, pure-routine clusters carry
+   ~0 predictive content; surfacing them for discretionary research is asking the operator
+   to evaluate definitionally-noisy candidates.
+5. **Documented IPO / new-listing edge case** — companies listed <3 years ago will tend
+   to show `opportunistic_count == unique_insiders` regardless of actual signal quality.
+6. **Documented fresh mcap re-check** — pipeline re-fetches market cap via yfinance after
+   the watchlist scan; tickers that drifted outside $200M–$3B since the (up-to-7-day-stale)
+   watchlist cache are discarded.
 
 ---
 

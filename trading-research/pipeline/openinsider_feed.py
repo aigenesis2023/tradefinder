@@ -336,7 +336,8 @@ def scan(recent_window_days: int = 45, history_days: int = 1100) -> list[Insider
     for cluster in clusters:
         members = {t.name for t in cluster.transactions}
         ticker_history = history_by_ticker.get(cluster.ticker, [])
-        routine = classify_routine(members, cluster.cluster_end, ticker_history)
+        routine = classify_routine(members, cluster.cluster_end, ticker_history,
+                                    cluster.cluster_start)
         cluster.routine_insiders = sorted(routine)
         cluster.opportunistic_count = len(members - routine)
 

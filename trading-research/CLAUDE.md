@@ -119,6 +119,58 @@ pure market beta. **Do not run this as a sole strategy expecting outperformance.
 
 ---
 
+## Permutation test — does the cluster pattern actually add value? (2026-05-13)
+
+We ran a randomized control trial on the 7-year backtest (n=232 signals, 2018-2024)
+to answer: "does the insider-cluster pattern predict returns better than randomly
+selecting mid-cap stocks from the same data?"
+
+The control group is drawn from the **same OpenInsider dataset, same filters, same
+$200M-$3B market-cap band** — the only difference is control stocks have 1 qualifying
+buyer (solo) while engine signals have 3+ buyers in a 30-day window (cluster).
+100 iterations, equal-weighted baskets per signal date.
+
+### IWM alpha comparison
+
+| Horizon | Engine (cluster 3+) | Control (solo 1 buyer) | p-value | Cohen's d | Engine %ile | Verdict |
+|---|---|---|---|---|---|---|
+| 7d | +1.09% | +0.14% | **0.03** | +1.89 | 97th | **SIGNIFICANT** |
+| 10d | +0.72% | +0.10% | 0.11 | +1.08 | 89th | Weak edge |
+| 30d | +1.03% | +0.22% | 0.20 | +0.77 | 80th | Not significant |
+| 60d | +2.16% | +0.94% | 0.23 | +0.81 | 77th | Not significant |
+| 90d | +2.69% | +2.79% | 0.50 | -0.05 | 50th | Zero |
+| 180d | +0.83% | +3.24% | 0.76 | -0.76 | **24th** | Engine UNDERPERFORMS |
+
+### What this means
+
+1. **The cluster pattern provides a real, statistically significant short-term timing
+   edge at 7 days.** Engine signals are at the 97th percentile of the random
+   distribution — this is genuine.
+
+2. **The edge decays rapidly.** By 30d it's not statistically significant. By 90d it's
+   gone entirely. At 180d the engine UNDERPERFORMS solo-buyer stocks.
+
+3. **Insider buying ITSELF carries significant alpha**, consistent with the academic
+   literature. The simplest possible screen ("any $200M-$3B stock where a director
+   bought $100K+") produces +3.24% alpha at 180d, nearly 4× the engine's +0.83%.
+
+4. **The 180-day hold horizon is contradicted by the data.** The engine's cluster signal
+   decays to noise by 30d and underperforms by 180d. The clustering pattern we detect
+   has a much shorter half-life than general insider buying.
+
+### Why this might be
+
+- **Coordinated buying campaigns** (3+ insiders in 30 days) often follow bad news (the
+  EFOR pattern — buying after a crash). The short-term pop is the cluster effect, but
+  the underlying business problems don't resolve in 180 days.
+- **Solo-buyer stocks** are more likely to be steady insider accumulation without a
+  preceding crash — the classic "insiders buy before good news" pattern.
+- The 30d cluster window may be selecting for *crisis-response clusters* rather than
+  *anticipatory clusters*. The former create a short-term floor but don't lead to
+  sustained outperformance.
+
+---
+
 ## Pipeline flow (v3.0)
 
 ```
@@ -260,7 +312,7 @@ earlier versions were on the short end of academic guidance.
 - Liquidity floor: if 20d ADV < $500K → `liquidity_warning`, additionally cap position at 5% of ADV.
 - No cluster-size multipliers. No regime multipliers. No elite-tier sizing.
 
-Rationale: neither the literature nor our own backtest (n=65 events, statistically too small)
+Rationale: neither the literature nor our own backtest (n=383 measured signals)
 supports differential sizing on cluster size, market regime, or "elite" extensions. Flat
 sizing is the only defensible default.
 
@@ -384,18 +436,31 @@ committing capital.
 
 ## Honest caveats (DO read before operating)
 
-1. **Sample-size limit**: our own backtest cohort is n=65 after dedup. Too small to validate
-   any sub-rule. The engine is calibrated against the broader academic literature, not against
-   our small empirical sample.
-2. **Effect attenuation**: post-Sarbanes-Oxley (2002), the disclosure lag dropped from 40 days
+1. **Sample-size limit**: our 7-year (2018-2024) OpenInsider backtest has n=383 measured
+   signals (n=232 for the cluster-3+ sub-cohort used in permutation testing). This is adequate
+   for headline statistics but insufficient for sub-rule validation. The engine is calibrated
+   against the broader academic literature.
+2. **Cluster signal decays — engine is a short-timing tool, not a 180d hold strategy**: a
+   permutation test (100 iterations, same OpenInsider data, same $200M-$3B band) found the
+   cluster pattern adds a real 7d edge (p=0.03, d=+1.89) but this edge decays to statistical
+   insignificance by 30d and **reverses** by 180d (engine +0.83% alpha vs solo-buyer +3.24%).
+   The engine's strongest use case is short-term timing, not the 180d hold the literature
+   recommends for general insider buying. The cluster filter may be selecting crisis-response
+   clusters (buying after crashes) rather than anticipatory ones.
+3. **Simpler screens produce more 180d alpha**: the simplest possible filter ("any $200M-$3B
+   stock where one insider bought $100K+") produced +3.24% IWM alpha at 180d — nearly 4× the
+   engine's +0.83%. Insider buying itself carries alpha (consistent with Lakonishok-Lee,
+   Jeng-Metrick-Zeckhauser); the cluster pattern concentrates short-term timing at the expense
+   of long-term returns.
+4. **Effect attenuation**: post-Sarbanes-Oxley (2002), the disclosure lag dropped from 40 days
    to 2 business days. The classical effect is partially priced in faster now. Recent studies
    (post-2010) find smaller magnitudes than older studies.
-3. **Transaction costs eat thin edges**: at the bottom of the academic range, after 1% costs,
+5. **Transaction costs eat thin edges**: at the bottom of the academic range, after 1% costs,
    net edge approaches zero. Use limit orders; avoid market orders at this market-cap band.
-4. **Right-tail dependence**: a meaningful share of historical alpha comes from a few outsized
+6. **Right-tail dependence**: a meaningful share of historical alpha comes from a few outsized
    winners. Most trades will be modest gains or modest losses. Do not over-position any single
    signal.
-5. **Operator discipline matters more than the screen**: the discretionary research applied
+7. **Operator discipline matters more than the screen**: the discretionary research applied
    after the screen is where most of the realized outcome will come from. Cutting corners on
    research will produce worse results than not running the engine at all.
 

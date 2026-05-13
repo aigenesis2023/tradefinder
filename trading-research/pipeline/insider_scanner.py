@@ -64,6 +64,7 @@ def classify_routine(
     cluster_members: set[str],
     cluster_end_date: str,
     full_history: list[InsiderTransaction],
+    cluster_start_date: str | None = None,
 ) -> set[str]:
     """
     Classify each cluster member as routine vs opportunistic per Cohen-Malloy-Pomorski
@@ -73,16 +74,29 @@ def classify_routine(
     the past ROUTINE_PRIOR_YEARS years (default: 3). Routine trades carry ~0 predictive
     power; opportunistic trades drive the alpha.
 
+    The month(s) checked are those the cluster spans (cluster_start through cluster_end,
+    max 2 distinct months within the 30-day window). Each insider is checked against
+    every month their trades could fall in — if they have a routine pattern in ANY
+    spanned month, they are classified as routine.
+
     Returns the SET of names classified as routine. Members not in the set are
     opportunistic (the desirable class). Empty history -> all members opportunistic by
     default (an insider with no prior history cannot be routine).
     """
     try:
         end_dt = datetime.strptime(cluster_end_date, "%Y-%m-%d")
+        start_dt = (
+            datetime.strptime(cluster_start_date, "%Y-%m-%d")
+            if cluster_start_date
+            else end_dt
+        )
     except ValueError:
         return set()
 
-    signal_month = end_dt.month
+    # The 30-day cluster window spans at most 2 distinct calendar months.
+    # Check both: an insider who habitually buys one specific month each year
+    # shouldn't be misclassified just because the cluster ended in a different month.
+    months_to_check = list(dict.fromkeys([start_dt.month, end_dt.month]))
     signal_year = end_dt.year
 
     routine: set[str] = set()
@@ -91,18 +105,20 @@ def classify_routine(
             t for t in full_history
             if t.name == name and t.date < cluster_end_date
         ]
-        months_hit = 0
-        for years_back in range(1, ROUTINE_PRIOR_YEARS + 1):
-            target_year = signal_year - years_back
-            for t in prior_buys:
-                try:
-                    t_dt = datetime.strptime(t.date, "%Y-%m-%d")
-                except ValueError:
-                    continue
-                if t_dt.year == target_year and t_dt.month == signal_month:
-                    months_hit += 1
-                    break
-        if months_hit >= ROUTINE_PRIOR_YEARS:
-            routine.add(name)
+        for check_month in months_to_check:
+            months_hit = 0
+            for years_back in range(1, ROUTINE_PRIOR_YEARS + 1):
+                target_year = signal_year - years_back
+                for t in prior_buys:
+                    try:
+                        t_dt = datetime.strptime(t.date, "%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    if t_dt.year == target_year and t_dt.month == check_month:
+                        months_hit += 1
+                        break
+            if months_hit >= ROUTINE_PRIOR_YEARS:
+                routine.add(name)
+                break  # don't double-check the other month — already classified
 
     return routine

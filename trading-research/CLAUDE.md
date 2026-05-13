@@ -24,13 +24,14 @@ operator does on each surfaced ticker is where any additional edge is generated.
 | Unique insiders | ≥ 3 within a 30-day window | Lakonishok-Lee 2001; Alldredge-Blank 2019; Kang et al. 2018 |
 | Per-transaction floor | ≥ $100,000 each | Defensible default; literature emphasizes meaningful personal commitment |
 | Cluster window | **30 days** (v2.1, was 14d) | Academic studies use 1-3 month windows; insider campaigns span weeks |
-| EDGAR lookback (cluster) | **45 days** (v2.1, was 21d) | Accommodates 30d cluster window with buffer for cluster_end recency |
+| OpenInsider lookback (cluster) | **45 days** (v2.1, was 21d) | Accommodates 30d cluster window with buffer for cluster_end recency |
 | Routine/opportunistic check | 3-year history | Cohen-Malloy-Pomorski 2012 |
+| CMP reliability gate | **DATA INSUFFICIENT** label if stock has <3yr trading history | CMP routine classification is invalid for new listings; the report flags these honestly rather than gating |
 | Opportunistic soft gate | **≥1 opportunistic insider required** (v2.1) | Cohen-Malloy-Pomorski 2012: pure-routine clusters carry near-zero predictive content |
-| Qualifying roles | CEO, CFO, COO, Chairman, Director, President, EVP, SVP | Standard cohort |
+| Qualifying roles | CEO, CFO, COO, Chairman, Director, President, EVP, SVP (plus SEC abbreviations "Dir", "Pres") | Standard cohort; substring matching on Form 4 titles |
+| Price context | Current price + 52-week drawdown + insider VWAP comparison + pre-cluster crash flag | See Report Format section below |
 | Transaction code | "P" (open-market purchase) only | Excludes options/awards/gifts |
-| 10b5-1 plan trades | Excluded | Carry near-zero predictive value |
-| Institutional entity names | Excluded (LLC, LP, Fund, etc.) | Different motives than executive operators |
+| Institutional entity names | Excluded (LLC, LP, Fund, Bank, Trust, etc.) | Different motives than executive operators |
 | Market cap | $200M–$3B | Smaller-cap effect well-established (Lakonishok-Lee; Jeng et al.) |
 | Materiality threshold | **None** (v2.1, was 0.02%) | $100K × 3 = $300K minimum already enforces commitment; 0.02% was mathematically redundant |
 | Recommended hold | **180 days** (v2.1, was 90d) | Jeng-Metrick-Zeckhauser 2003; Cohen-Malloy-Pomorski 2012; Lakonishok-Lee 2001 |
@@ -75,57 +76,27 @@ opportunistic flag carries less discriminating information for recent IPOs / spi
 than for mature listings. Treat "100% opportunistic" on a < 3-year-old listing as
 roughly equivalent to "data insufficient to classify."
 
----
+### Enforced in report (2026-05-12)
 
-## The short-interest "disagreement" flag (informational only)
+The engine now detects this case automatically. When yfinance reports <3 years of
+trading history (via `firstTradeDateEpochUtc` with price-history fallback), the
+report replaces the misleading "ALL OPPORTUNISTIC" badge with:
 
-Per Chung, Sul, and Wang (2019, *Journal of Portfolio Management*): when insider buying
-coincides with elevated short interest, abnormal returns are amplified — corporate
-insiders (with private information) buying against the market's bet (heavy short positioning)
-creates a positively-skewed payoff distribution. Forced covering on positive catalysts
-adds mechanical upward pressure on top of the information edge.
+    Quality: DATA INSUFFICIENT (limited trading history)
 
-The engine fetches `shortPercentOfFloat` from yfinance for each surfaced ticker and tags
-clusters where short interest is between **10% and 40% of float** with a ⚡ DISAGREEMENT
-marker. The upper bound filters out distress/fraud names where insiders may buy
-defensively rather than informationally (Lee et al. 2018 — "false signaling" risk).
+And appends an education note:
 
-**The engine does NOT gate on short interest.** Reasons:
+    ⚠  DATA INSUFFICIENT: Limited trading history (<3 years).
+       IPO-period insider purchases are often pre-arranged allocations,
+       not discretionary conviction buys. Research accordingly.
 
-1. The Chung-Sul-Wang headline numbers show combined-signal lift mostly at 1-month
-   horizons; our 90-day hold sits in the decay window. Net incremental edge at 90d is
-   unclear.
-2. Gating at 10–40% SI cuts the candidate pool by an estimated ~90% — too few signals
-   for a discretionary screening tool.
-3. The false-signaling research (insiders buying defensively into shorted names with
-   price support fully reverting within a year) is a real failure mode the engine
-   should not bake in.
+This is a **metadata label, not a gate.** The cluster is still surfaced. The
+operator decides whether to research it. But the label prevents a brand-new IPO
+with pre-arranged insider allocations from masquerading as a high-conviction
+opportunistic cluster.
 
-Like the opportunistic flag, this is metadata for the operator's discretionary stage.
-
-Source for the short-interest value: `yfinance.Ticker.info["shortPercentOfFloat"]`
-(fallback to `sharesPercentSharesOut`). Data quality varies by ticker; `None` is
-reported when unavailable.
-
----
-
-## Analyst coverage count (informational only)
-
-Per Lakonishok-Lee (2001) and follow-up studies: insider-buying alpha is stronger
-in stocks with lower analyst coverage (information asymmetry is higher when fewer
-Wall Street analysts cover the name). The engine fetches `numberOfAnalystOpinions`
-from yfinance and surfaces it on each signal alongside short interest.
-
-**Not a gate.** Lower analyst count is generally a positive contextual marker for
-the insider-cluster signal, but the engine does not filter on it. The operator
-uses it during step-2 discretionary research to assess whether a candidate is
-genuinely under-researched (~5 or fewer analysts) or a small-cap name that is
-already well-followed.
-
-The $200M–$3B market-cap band already biases the universe toward lower coverage,
-so this field often shows single-digit counts. When it shows 15–20+ analysts,
-the candidate is a well-followed small-cap and the information edge per the
-literature is likely smaller.
+Additionally, each signal now shows price context (current price + 52-week drawdown)
+to surface crash-buying or distressed-entry patterns at a glance.
 
 ---
 
@@ -151,23 +122,27 @@ pure market beta. **Do not run this as a sole strategy expecting outperformance.
 ## Pipeline flow (v3.0)
 
 ```
-1. RegimeCheck         VIX/VIX3M, IWM vs 20d MA — INFORMATIONAL ONLY
-2. OpenInsider Scrape  one HTTP feed call for the last ~3 years; cached per quarter
-3. Filter              role + entity-name filters; ≥$100K per transaction
-4. Cluster Detect      per ticker, find best 30d window with 3+ unique insiders in
+1. OpenInsider Scrape  one HTTP feed call for the last ~3 years; cached per quarter
+2. Filter              role + entity-name + $100K minimum per transaction.
+                       Roles matched by substring (includes "Dir"/"Pres" abbreviations)
+3. Cluster Detect      per ticker, find best 30d window with 3+ unique insiders in
                        the last 45 days. Exactly ONE cluster surfaced per ticker.
-5. OpportunisticTag    routine/opportunistic classification per CMP 2012 using the
+4. OpportunisticTag    routine/opportunistic classification per CMP 2012 using the
                        same 3-year scraped history
-6. OpportunisticGate   discard clusters with 0 opportunistic insiders
-7. yfinance Enrich     for each surviving cluster: market cap, ADV, short interest,
-                       analyst count, sector
-8. McapFilter          discard if market cap outside $200M-$3B
-9. Rank                by (opportunistic_count desc, unique_insiders desc, materiality desc)
-10. Report             markdown report + SQLite logging for outcome tracking
+5. OpportunisticGate   discard clusters with 0 opportunistic insiders
+6. yfinance Enrich     for each surviving cluster: market cap, company name, current
+                       price, 52w high, trading history days. 24h JSON cache.
+7. McapFilter          discard if market cap outside $200M-$3B
+8. Insider VWAP        compute volume-weighted avg price from t.shares * t.price_per_share
+9. Pre-cluster Close   fetch max close in 10 trading days before cluster_start (yfinance)
+10. CMP Reliability    if <3yr trading history → label DATA INSUFFICIENT (metadata,
+                       not a gate — cluster still surfaces)
+11. Rank               by (opportunistic_count desc, unique_insiders desc, total_usd desc)
+12. Report             markdown report with full price context + SQLite logging
 ```
 
 No agents. No LLM calls. No multi-step debate. No scoring formula with weights.
-No regime gating. No sizing multipliers. No fixed materiality % filter.
+No regime gating. No sizing multipliers. No short-interest or analyst-coverage gates.
 
 ### v3.0 architecture change
 
@@ -207,7 +182,64 @@ the residual risk.
 
 ---
 
-## Exit framework (advisory — operator executes manually)
+## Report format (v3.1 — 2026-05-13)
+
+Each signal in the report now includes:
+
+```
+1. TICKER — Company Name
+   Cluster: N insiders | $X,XXX,XXX total | Quality: ALL OPPORTUNISTIC
+   Routine traders (low signal value): ...  (if any)
+   Market cap: $XXXM
+   Price: $XX.XX (±X.X% from 52w high) | Insider avg: $XX.XX (current X.X% above/below)
+   Cluster window: YYYY-MM-DD -> YYYY-MM-DD (Nd ago)
+   Purchases: Name (Role, Date @ $price, $size), ...
+   ⚠  Pre-cluster: $XX.XX — insiders bought after XX% crash  (if >20% decline)
+   Pre-cluster: $XX.XX — insiders bought into XX% decline     (if >5% decline)
+   Recommended hold: 180 days
+```
+
+### New fields (2026-05-13)
+
+| Field | Source | What it tells the operator |
+|---|---|---|
+| Insider purchase prices | `InsiderTransaction.price_per_share` and `.total_usd` | What each insider actually paid |
+| Insider VWAP vs current | `t.shares * t.price_per_share / total_shares` | Whether insiders are up or down on their trade |
+| Staleness (Nd ago) | `date.today() - cluster_end` | How stale the signal is (can be up to 45d) |
+| Pre-cluster crash flag | `_get_pre_cluster_close()` — max close in 10 trading days before `cluster_start` | Whether the cluster formed after a crash |
+
+The pre-cluster crash flag uses the **maximum** close in the 10-day lookback (not the
+last close). This ensures it captures the pre-crash price even when `cluster_start`
+immediately follows the crash. Example: EFOR crashed -52% on Apr 23; insiders bought
+Apr 24. The last close before Apr 24 was $19.53 (the crashed price), but the max close
+was $40.55 (the pre-crash price). Using max surfaces the real story.
+
+### EFOR case study (why this matters)
+
+On 2026-05-12, EFOR showed "5 insiders, $1.5M, ALL OPPORTUNISTIC" — looks like a
+strong signal. But the pre-cluster flag reveals: `⚠ Pre-cluster: $40.55 — insiders
+bought after 52% crash`. The insiders bought the day after a catastrophic Q1 2026
+earnings miss (EPS $0.69 vs $0.98 consensus). CEO put $1M at $19.24.
+
+Without the flag, this looks equivalent to insiders accumulating in stable conditions.
+With the flag, the operator knows to research whether this is conviction buying
+("market overreacted") or management defending the stock. The answer requires
+fundamental analysis of the business — the engine's job is to surface the question.
+
+---
+
+## Web access workaround (deepseek model)
+
+The `WebSearch` tool is unsupported on deepseek-v4-pro (returns API error). The `WebFetch`
+tool works. For web research in this project:
+
+1. **Search**: `WebFetch` → `https://html.duckduckgo.com/html/?q=your+query`
+2. **Read article**: `WebFetch` → specific article URL
+3. **Fallback**: `curl` or Python `requests` via Bash; yfinance `.news` for recent headlines
+
+Do not rely on `WebSearch`. Use the DuckDuckGo → WebFetch two-step pattern.
+
+---
 
 1. **Time stop**: 180 trading days. Single horizon for all signals.
 2. **Hard stop**: −20% from entry (loose, to handle 180d variance — tight stops kick out winners early at this horizon).
@@ -231,26 +263,6 @@ earlier versions were on the short end of academic guidance.
 Rationale: neither the literature nor our own backtest (n=65 events, statistically too small)
 supports differential sizing on cluster size, market regime, or "elite" extensions. Flat
 sizing is the only defensible default.
-
----
-
-## Dedup
-
-- Same ticker: 5-day cooldown.
-- No theme dedup, supply-chain dedup, or sector dedup.
-
----
-
-## Regime — informational only
-
-VIX/VIX3M ratio and IWM vs 20d MA are computed and displayed at the top of each report.
-They do not gate signals or modify position size. Rationale:
-
-1. Our n=65 backtest cohort was unconditional on regime; any regime overlay would be
-   untested.
-2. Literature is mixed on regime sensitivity — some studies find stronger effect in
-   bear markets; others find no clean regime split. No consensus on a tractable rule.
-3. Operator can apply regime context in their discretionary research.
 
 ---
 
@@ -289,8 +301,6 @@ per month on average; many days will be empty.
 3. **$200M–$3B market cap** (was $500M–$5B) — smaller-cap effect stronger per literature.
 4. **Flat 1.0x sizing** (was cluster-size tiered) — no statistical basis for differentiation.
 5. **Step-1 screening framing** — engine explicitly positioned as research-input, not standalone strategy.
-6. **Short interest + DISAGREEMENT flag** (Chung-Sul-Wang 2019) — informational metadata.
-7. **Analyst coverage count** (Lakonishok-Lee 2001) — informational metadata.
 
 ## What changed in v2.1 (external review feedback)
 
@@ -313,6 +323,22 @@ per month on average; many days will be empty.
    the watchlist scan; tickers that drifted outside $200M–$3B since the (up-to-7-day-stale)
    watchlist cache are discarded.
 
+## What changed in v3.1 (2026-05-13 — signal-quality report enhancements)
+
+1. **Insider purchase prices in report** — each purchase shows price paid and size
+   (e.g., `CEO @ $19.24, $999,786`). Previously only name, role, date.
+2. **Insider VWAP vs current price** — volume-weighted average purchase price compared
+   to current market price, with % delta ("current 3.9% below"). Shows whether
+   insiders are in the money or underwater.
+3. **Staleness indicator** — cluster window line appends days since last purchase
+   (e.g., `(16d ago)`). Makes recency obvious without mental math.
+4. **Pre-cluster crash flag** — fetches max close in 10 trading days before
+   `cluster_start`. Flags if insiders bought after a crash (>20% decline = ⚠ flag,
+   >5% decline = context note). Uses max close (not last close) so it captures
+   the pre-crash price even when cluster_start immediately follows the crash day.
+5. **Web access workaround documented** — `WebFetch` + DuckDuckGo HTML search as
+   alternative to `WebSearch` (unsupported on deepseek-v4-pro).
+
 ---
 
 ## Domicile
@@ -328,9 +354,7 @@ the scanner. Foreign-domiciled US-listed names that file Form 4 flow through nor
   aggregated feed of SEC Form 4 filings, scraped via HTTP with local quarterly
   caching. Free, no API key, no published rate limits (we throttle to 0.4s
   between requests). The same source used by the backtest.
-- **yfinance**: per-cluster enrichment — market cap, price, ADV, sector, short
-  interest, analyst count.
-- **VIX, VIX3M, IWM** (via yfinance): regime context (informational only).
+- **yfinance**: per-cluster enrichment — market cap, company name.
 
 SEC EDGAR is no longer directly scraped in v3.0. OpenInsider aggregates Form 4
 filings from EDGAR, so the underlying authority is the same; the difference is

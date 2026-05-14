@@ -231,8 +231,10 @@ class StatisticalBreaker:
 
             perm_performances[i] = backtest_func(shuffled_signals, forward_returns)
 
-        # Two-sided p-value
-        p_value = np.mean(perm_performances >= original_perf)
+        # Two-sided p-value: test whether original performance is extreme
+        # in either direction compared to the null distribution
+        p_value = np.mean(np.abs(perm_performances - np.mean(perm_performances))
+                          >= np.abs(original_perf - np.mean(perm_performances)))
         p_value = max(p_value, 1.0 / (self.n_permutations + 1))
 
         is_significant = p_value < DEFAULT_PERMUTATION_ALPHA
@@ -977,7 +979,19 @@ class RegimeAnalyzer:
                 structural_breaks=[],
             )
 
-        # Linear trend
+        # Derive step size in years from actual dates in the index
+        if hasattr(rolling_alphas.index, 'to_series'):
+            try:
+                index_dates = pd.to_datetime(rolling_alphas.index)
+                total_span_years = (index_dates[-1] - index_dates[0]).days / 365.25
+                n_steps = len(rolling_alphas)
+                step_years = total_span_years / max(n_steps - 1, 1) if n_steps > 1 else 0.25
+            except (TypeError, AttributeError):
+                step_years = 0.25  # default: assume quarterly steps
+        else:
+            step_years = 0.25
+
+        # Linear trend — x in window steps
         x = np.arange(len(rolling_alphas))
         y = rolling_alphas.values
 
@@ -999,11 +1013,13 @@ class RegimeAnalyzer:
 
         slope, intercept, r_value, p_value, std_err = stats.linregress(x_valid, y_valid)
 
-        # Edge half-life estimation
-        # If alpha(t) = alpha(0) * exp(-lambda * t), then lambda = -slope / intercept
+        # Edge half-life estimation.
+        # Half-life is computed in window steps (from the linear fit on integer x),
+        # then converted to years using the inferred step size.
         if intercept > 0 and slope < 0:
-            lambda_est = abs(slope) / intercept
-            half_life = np.log(2) / lambda_est if lambda_est > 0 else float("inf")
+            lambda_est = abs(slope) / intercept  # decay rate per window step
+            half_life_steps = np.log(2) / lambda_est if lambda_est > 0 else float("inf")
+            half_life = half_life_steps * step_years  # convert steps → years
         elif intercept <= 0:
             half_life = 0.0
         else:

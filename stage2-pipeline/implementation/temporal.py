@@ -156,6 +156,60 @@ class LookAheadBreach:
     description: str
 
 
+def _is_us_market_holiday(dt) -> bool:
+    """Check if a date is a US market holiday (NYSE schedule).
+
+    Fallback used when the `holidays` package is not installed.
+    Covers the major holidays; does not handle early closes.
+    """
+    import calendar as _cal
+
+    month = dt.month
+    day = dt.day
+    year = dt.year
+    weekday = dt.weekday()  # 0=Mon, 6=Sun
+
+    # New Year's Day (Jan 1, observed Mon if Sun, Fri if Sat)
+    if month == 1 and day == 1:
+        return True
+    if month == 1 and day == 2 and weekday == 0:  # Mon after Sun Jan 1
+        return True
+
+    # Martin Luther King Jr. Day (3rd Monday of January)
+    if month == 1 and weekday == 0 and 15 <= day <= 21:
+        return True
+
+    # Presidents' Day (3rd Monday of February)
+    if month == 2 and weekday == 0 and 15 <= day <= 21:
+        return True
+
+    # Memorial Day (last Monday of May)
+    if month == 5 and weekday == 0 and day >= 25:
+        return True
+
+    # Juneteenth (June 19, observed Fri/Mon if weekend)
+    if month == 6 and day == 19:
+        return True
+
+    # Independence Day (July 4, observed Fri if Sat, Mon if Sun)
+    if month == 7 and day == 4:
+        return True
+
+    # Labor Day (1st Monday of September)
+    if month == 9 and weekday == 0 and day <= 7:
+        return True
+
+    # Thanksgiving (4th Thursday of November)
+    if month == 11 and weekday == 3 and 22 <= day <= 28:
+        return True
+
+    # Christmas (Dec 25, observed Mon if Sun, Fri if Sat)
+    if month == 12 and day == 25:
+        return True
+
+    return False
+
+
 # ============================================================================
 # Point-in-Time Data Builder
 # ============================================================================
@@ -187,11 +241,35 @@ class PointInTimeBuilder:
         self._lag_stats: Dict[str, List[int]] = {}
 
     def _default_trading_calendar(self) -> pd.DataFrame:
-        """Generate a default US trading calendar."""
-        # In production, this would use pandas_market_calendars or equivalent
-        # For now, generate a Monday-Friday calendar excluding common holidays
+        """Generate a default US trading calendar excluding major US holidays.
+
+        Uses NYSE holiday schedule (approximate). For exact schedule, use
+        pandas_market_calendars package.
+        """
+        # Try to use the holidays package for accurate US market holidays
+        try:
+            import holidays as _holidays_module
+            us_holidays = _holidays_module.UnitedStates(years=range(2000, 2031))
+        except ImportError:
+            us_holidays = None
+
         dates = pd.date_range("2000-01-01", "2030-12-31", freq="B")
-        return pd.DataFrame({"date": dates, "is_trading_day": True})
+        trading_days = []
+
+        for d in dates:
+            # Weekends already excluded by freq="B"
+            # Check if this is a known US market holiday
+            is_holiday = False
+            if us_holidays is not None:
+                is_holiday = d.date() in us_holidays
+            else:
+                # Fallback: hardcoded major holidays
+                is_holiday = _is_us_market_holiday(d)
+
+            if not is_holiday:
+                trading_days.append(d)
+
+        return pd.DataFrame({"date": trading_days, "is_trading_day": True})
 
     def register_data_source(
         self,
@@ -283,9 +361,11 @@ class PointInTimeBuilder:
         raw_data = raw_data.copy()
         raw_data[timestamp_field] = pd.to_datetime(raw_data[timestamp_field])
 
-        # Compute known_date for each raw data point
-        raw_data["known_date"] = raw_data[timestamp_field] + pd.Timedelta(
-            days=metadata.known_date_offset_days
+        # Compute known_date for each raw data point.
+        # Use business days (not calendar days) to avoid look-ahead:
+        # a Friday filing with 1-day offset becomes known on Monday, not Saturday.
+        raw_data["known_date"] = raw_data[timestamp_field] + pd.tseries.offsets.BusinessDay(
+            n=metadata.known_date_offset_days
         )
 
         # Build PIT dataset iteratively for each observation date
@@ -617,8 +697,10 @@ class ForwardReturnCalculator:
                 entry_date = entry_prices.index[0]
                 entry_price = entry_prices.iloc[0]
 
-                # Find exit price (after holding period)
-                exit_date_cutoff = entry_date + pd.Timedelta(days=holding_period_days)
+                # Find exit price (after holding period).
+                # Use business days so holding_period_days means actual trading days,
+                # not calendar days (which would be ~30% shorter due to weekends).
+                exit_date_cutoff = entry_date + pd.tseries.offsets.BusinessDay(n=holding_period_days)
                 exit_prices = ticker_prices[ticker_prices.index <= exit_date_cutoff]
                 if exit_prices.empty or exit_prices.index[-1] <= entry_date:
                     continue
@@ -756,7 +838,8 @@ class SECFilingAligner:
         """
         filings = filings.copy()
         filings[acceptance_date_field] = pd.to_datetime(filings[acceptance_date_field])
-        filings["known_date"] = filings[acceptance_date_field] + pd.Timedelta(days=1)
+        # 1 business day after SEC acceptance (not 1 calendar day)
+        filings["known_date"] = filings[acceptance_date_field] + pd.tseries.offsets.BusinessDay(n=1)
 
         aligned_records = []
 

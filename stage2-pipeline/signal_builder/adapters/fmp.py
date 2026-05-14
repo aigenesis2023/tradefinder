@@ -63,7 +63,11 @@ class FMPAdapter(DataAdapter):
         self._have_key = bool(self._api_key)
 
     def health_check(self) -> Tuple[bool, str]:
-        """Check if FMP API is accessible with current key."""
+        """Check if FMP API is accessible with current key.
+
+        NOTE: Even if the health check succeeds, acquire() will still raise
+        DataAcquisitionError because the adapter is a non-functional skeleton.
+        """
         if not self._have_key:
             return False, "No FMP API key. Set FMP_API_KEY env var. Free tier available at financialmodelingprep.com"
         try:
@@ -73,7 +77,7 @@ class FMPAdapter(DataAdapter):
                 timeout=10,
             )
             if resp.status_code == 200:
-                return True, "FMP API accessible"
+                return False, "FMP API key valid but adapter is NOT IMPLEMENTED — endpoint routing is a stub"
             return False, f"FMP API returned {resp.status_code}: {resp.text[:200]}"
         except Exception as e:
             return False, f"FMP API unreachable: {e}"
@@ -81,30 +85,16 @@ class FMPAdapter(DataAdapter):
     def acquire(self, spec: DataSourceSpec) -> RawData:
         """Acquire data from FMP.
 
-        Maps source_type to the appropriate FMP endpoint.
-        Returns UNTESTABLE if no API key is available.
+        Always raises DataAcquisitionError — this adapter is a non-functional skeleton.
         """
-        if not self._have_key:
-            raise DataAcquisitionError(
-                source="FMP",
-                reason=(
-                    "FMP API key not available. Set FMP_API_KEY environment variable. "
-                    "Free tier available at https://financialmodelingprep.com — "
-                    "250 requests/day, sufficient for point-in-time index constituents "
-                    "and financial data."
-                ),
-                missing_data="FMP premium data (historical constituents, financials)",
-            )
-
-        # STUB: Full implementation would call FMP API
-        return self._acquire_stub(spec)
-
-    def _acquire_stub(self, spec: DataSourceSpec) -> RawData:
-        """Stub implementation that returns synthetic data when no live data."""
         raise DataAcquisitionError(
             source="FMP",
-            reason="FMP adapter connected but endpoint routing not implemented. "
-                   "This is a skeleton adapter.",
+            reason=(
+                "FMP adapter is a non-functional skeleton. Endpoint routing is not "
+                "implemented. Set FMP_API_KEY and implement endpoint routing to use. "
+                "Free tier available at https://financialmodelingprep.com — "
+                "250 requests/day."
+            ),
             missing_data=f"FMP {spec.source_type} data",
         )
 

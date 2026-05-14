@@ -9,8 +9,8 @@ Data sources (free, no API key required for basic access):
   - Interest rates, GDP, employment, inflation, etc.
   - Federal Reserve data releases
 
-Status: FUNCTIONAL SKELETON — uses fredapi when available.
-  Falls back to synthetic macro data when API is unavailable.
+If fredapi is not installed or the API key is missing, raises
+DataAcquisitionError — no synthetic data is ever generated.
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ class FREDAdapter(DataAdapter):
 
     Requires fredapi for live data (pip install fredapi).
     FRED API key is free from https://fred.stlouisfed.org/docs/api/api_key.html
+    If the API is unavailable, raises DataAcquisitionError — no synthetic fallback.
     """
 
     @property
@@ -68,7 +69,7 @@ class FREDAdapter(DataAdapter):
 
     @property
     def version(self) -> str:
-        return "1.0.0"
+        return "2.0.0"
 
     def __init__(self, api_key: Optional[str] = None):
         self._api_key = api_key or os.environ.get("FRED_API_KEY", "")
@@ -77,73 +78,55 @@ class FREDAdapter(DataAdapter):
         """Check if FRED is accessible."""
         try:
             import fredapi
-            return True, "fredapi available"
+            if not self._api_key:
+                return False, "FRED_API_KEY not set. Free key at https://fred.stlouisfed.org/docs/api/api_key.html"
+            return True, "fredapi available with API key"
         except ImportError:
             return False, "fredapi not installed (pip install fredapi). Free API key at fred.stlouisfed.org"
 
     def acquire(self, spec: DataSourceSpec) -> RawData:
         """Acquire macro data for specified series codes.
 
-        Args:
-            spec: DataSourceSpec with fields listing FRED series codes.
-
-        Returns:
-            RawData with macro time series.
+        Raises DataAcquisitionError if fredapi is not installed, no API key
+        is available, or all series fail to fetch. No synthetic fallback.
         """
         series_codes = spec.fields if spec.fields else list(COMMON_SERIES.keys())
 
         try:
             import fredapi
-            if not self._api_key:
-                raise ValueError("FRED_API_KEY not set")
-            fred = fredapi.Fred(api_key=self._api_key)
-            macro_data = {}
-            for code in series_codes:
-                actual_code = COMMON_SERIES.get(code, code)
-                try:
-                    series = fred.get_series(actual_code, observation_start=spec.start_date, observation_end=spec.end_date)
-                    macro_data[code] = series
-                except Exception as e:
-                    logger.warning(f"Failed to get FRED series {code}: {e}")
-
-            if macro_data:
-                df = pd.DataFrame(macro_data)
-                df.index.name = "date"
-                df = df.reset_index()
-
-                return RawData(
-                    records=df,
-                    source_type=spec.source_type,
-                    provider="fred",
-                    metadata={
-                        "n_series": len(macro_data),
-                        "date_range": f"{spec.start_date} to {spec.end_date}",
-                    },
-                )
         except ImportError:
-            pass
-        except Exception as e:
-            logger.warning(f"FRED live data failed: {e}")
+            raise DataAcquisitionError(
+                source="FRED",
+                reason="fredapi not installed (pip install fredapi). "
+                       "Free API key available at https://fred.stlouisfed.org/docs/api/api_key.html",
+                missing_data=f"FRED macro series: {', '.join(series_codes[:5])}...",
+            )
 
-        # Fallback: generate synthetic macro data
-        return self._synthetic_macro(spec, series_codes)
+        if not self._api_key:
+            raise DataAcquisitionError(
+                source="FRED",
+                reason="FRED_API_KEY not set. Free key at https://fred.stlouisfed.org/docs/api/api_key.html",
+                missing_data=f"FRED macro series: {', '.join(series_codes[:5])}...",
+            )
 
-    def _synthetic_macro(self, spec: DataSourceSpec, series_codes: List[str]) -> RawData:
-        """Generate synthetic macro data for testing."""
-        np.random.seed(137)
-        dates = pd.date_range(spec.start_date, spec.end_date, freq="ME")
-        data = {}
+        fred = fredapi.Fred(api_key=self._api_key)
+        macro_data = {}
         for code in series_codes:
-            if code in ("FEDFUNDS",):
-                data[code] = np.cumsum(np.random.randn(len(dates)) * 0.1) + 2.5
-            elif code in ("DGS10", "T10YIE"):
-                data[code] = np.cumsum(np.random.randn(len(dates)) * 0.05) + 3.0
-            elif code in ("VIXCLS",):
-                data[code] = 15 + 5 * np.random.randn(len(dates)) + 5 * np.sin(np.linspace(0, 10, len(dates)))
-            else:
-                data[code] = np.cumsum(np.random.randn(len(dates)) * 0.5) + 100
+            actual_code = COMMON_SERIES.get(code, code)
+            try:
+                series = fred.get_series(actual_code, observation_start=spec.start_date, observation_end=spec.end_date)
+                macro_data[code] = series
+            except Exception as e:
+                logger.warning(f"Failed to get FRED series {code}: {e}")
 
-        df = pd.DataFrame(data, index=dates)
+        if not macro_data:
+            raise DataAcquisitionError(
+                source="FRED",
+                reason=f"All {len(series_codes)} FRED series failed to fetch.",
+                missing_data=f"FRED macro series: {', '.join(series_codes[:5])}...",
+            )
+
+        df = pd.DataFrame(macro_data)
         df.index.name = "date"
         df = df.reset_index()
 
@@ -151,7 +134,10 @@ class FREDAdapter(DataAdapter):
             records=df,
             source_type=spec.source_type,
             provider="fred",
-            metadata={"synthetic": True, "n_series": len(series_codes)},
+            metadata={
+                "n_series": len(macro_data),
+                "date_range": f"{spec.start_date} to {spec.end_date}",
+            },
         )
 
     def validate(self, raw_data: RawData) -> Tuple[bool, List[str]]:

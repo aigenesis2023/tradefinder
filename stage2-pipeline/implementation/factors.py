@@ -44,6 +44,53 @@ logger = logging.getLogger(__name__)
 
 TRADING_DAYS_PER_YEAR = 252
 TRADING_DAYS_PER_MONTH = 21
+
+
+def _newey_west_se(X: np.ndarray, residuals: np.ndarray, max_lags: int) -> np.ndarray:
+    """Compute Newey-West HAC standard errors.
+
+    Heteroskedasticity and autocorrelation consistent (HAC) covariance estimator.
+    Uses the Bartlett kernel with automatic lag selection following
+    Newey & West (1987, 1994).
+
+    Args:
+        X: Design matrix (n_obs x n_params).
+        residuals: Residual vector (n_obs,).
+        max_lags: Maximum lags for autocorrelation truncation.
+
+    Returns:
+        Standard errors for each coefficient (n_params,).
+    """
+    n_obs = X.shape[0]
+    X_inv = np.linalg.inv(X.T @ X)
+
+    # Bread: (X'X)^(-1)
+    # Meat: sum of weighted autocovariances
+    # HAC variance = Bread * Meat * Bread
+
+    # Middle matrix S0 (heteroskedasticity component)
+    S = np.zeros((X.shape[1], X.shape[1]))
+    for t in range(n_obs):
+        x_t = X[t:t+1].T
+        e_t = residuals[t]
+        S += (e_t ** 2) * (x_t @ x_t.T)
+
+    # Autocorrelation components with Bartlett kernel
+    for lag in range(1, max_lags + 1):
+        weight = 1.0 - lag / (max_lags + 1.0)  # Bartlett kernel
+        for t in range(lag, n_obs):
+            x_t = X[t:t+1].T
+            x_tlag = X[t-lag:t-lag+1].T
+            e_t = residuals[t]
+            e_tlag = residuals[t - lag]
+            cross = (x_t @ x_tlag.T) + (x_tlag @ x_t.T)
+            S += weight * e_t * e_tlag * cross
+
+    hac_cov = X_inv @ S @ X_inv
+    return np.sqrt(np.maximum(np.diag(hac_cov), 0.0))
+
+
+
 FACTOR_ALPHA_SIGNIFICANCE = 0.05
 
 
@@ -823,16 +870,18 @@ class FactorComparisonEngine:
         y_pred = X @ beta
         residuals = y - y_pred
 
-        # Standard errors
-        sse = np.sum(residuals ** 2)
-        mse = sse / (n_obs - n_params)
-        se = np.sqrt(mse * np.diag(np.linalg.inv(X.T @ X)))
+        # Newey-West HAC standard errors (heteroskedasticity and autocorrelation
+        # consistent). Financial return series exhibit both. max_lags = floor(4 * (T/100)^(2/9))
+        # is the standard Newey-West automatic lag selection.
+        max_lags = max(1, int(4 * (n_obs / 100.0) ** (2 / 9)))
+        se = _newey_west_se(X, residuals, max_lags)
 
         # t-statistics and p-values
         t_stats = beta / se
         p_values = 2 * (1 - stats.t.cdf(np.abs(t_stats), n_obs - n_params))
 
         # R-squared
+        sse = np.sum(residuals ** 2)
         ss_total = np.sum((y - np.mean(y)) ** 2)
         r_squared = 1 - sse / ss_total if ss_total > 0 else 0
         adj_r_squared = 1 - (1 - r_squared) * (n_obs - 1) / (n_obs - n_params)
@@ -843,10 +892,11 @@ class FactorComparisonEngine:
             alpha_t_stat = t_stats[0]
             alpha_p_value = p_values[0]
 
-            # 95% CI for alpha
+            # 95% CI for alpha — use t-critical, not z (1.96)
+            t_crit = stats.t.ppf(0.975, n_obs - n_params)
             alpha_ci = (
-                (beta[0] - 1.96 * se[0]) * TRADING_DAYS_PER_YEAR,
-                (beta[0] + 1.96 * se[0]) * TRADING_DAYS_PER_YEAR,
+                (beta[0] - t_crit * se[0]) * TRADING_DAYS_PER_YEAR,
+                (beta[0] + t_crit * se[0]) * TRADING_DAYS_PER_YEAR,
             )
 
             # Factor loadings

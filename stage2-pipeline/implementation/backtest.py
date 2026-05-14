@@ -711,13 +711,15 @@ class WalkForwardBacktester:
                     "cost_bps": cost.cost_bps,
                 })
 
-            # Calculate forward return for these positions
-            # In production, track portfolio through time with entry/exit events
-            day_return = 0.0
-            day_cost = sum(t["total_cost"] for t in trades[-len(positions):])
-
-            portfolio_value = portfolio_value * (1 + day_return)
-            portfolio_values.append(portfolio_value)
+            # WalkForwardBacktester forward return computation is not yet
+            # implemented. The pipeline uses CrossSectionalBacktester which
+            # has full forward return logic. To implement: compute holding-
+            # period returns per position using price_df, then aggregate
+            # to portfolio level.
+            raise NotImplementedError(
+                "WalkForwardBacktester forward return computation is not implemented. "
+                "Use CrossSectionalBacktester for production backtests."
+            )
 
         # Compile results
         trades_df = pd.DataFrame(trades)
@@ -957,6 +959,7 @@ class CrossSectionalBacktester:
             returns_series=returns_series,
             start_date=rebalance_dates[0] if rebalance_dates else "",
             end_date=rebalance_dates[-1] if rebalance_dates else "",
+            holding_period_days=holding_period_days,
         )
 
     def _compute_cohort_return(
@@ -1010,10 +1013,32 @@ class CrossSectionalBacktester:
         returns_series: pd.Series,
         start_date: str,
         end_date: str,
+        holding_period_days: int = 21,
     ) -> BacktestResult:
-        """Compile cross-sectional backtest result."""
+        """Compile cross-sectional backtest result.
+
+        Annualization is derived from the actual calendar span of the return
+        series and the holding period, NOT from the count of observations.
+        This is critical when returns are multi-day holding period returns
+        rather than daily returns.
+        """
         n_trading_days = len(returns_series)
-        n_years = max(n_trading_days / 252.0, 0.01)
+
+        # Derive n_years from actual calendar span (not observation count)
+        if not returns_series.empty and len(returns_series.index) >= 2:
+            try:
+                calendar_days = (returns_series.index[-1] - returns_series.index[0]).days
+                n_years = max(calendar_days / 365.25, 0.01)
+            except (TypeError, AttributeError):
+                n_years = max(n_trading_days / 252.0, 0.01)
+        else:
+            n_years = max(n_trading_days / 252.0, 0.01)
+
+        # Annualization factor for holding-period returns:
+        # Daily returns: scale by sqrt(252)
+        # H-day returns: scale by sqrt(252 / H)
+        periods_per_year = max(252.0 / holding_period_days, 1.0)
+        ann_vol_factor = np.sqrt(periods_per_year)
 
         if returns_series.empty:
             gross_total_return = 0.0
@@ -1024,7 +1049,7 @@ class CrossSectionalBacktester:
         else:
             gross_total_return = (1 + returns_series).prod() - 1
             gross_ann_return = (1 + gross_total_return) ** (1 / n_years) - 1
-            gross_ann_vol = returns_series.std() * np.sqrt(252)
+            gross_ann_vol = returns_series.std() * ann_vol_factor
             gross_sharpe = gross_ann_return / gross_ann_vol if gross_ann_vol > 0 else 0.0
             cum_returns = (1 + returns_series).cumprod()
             gross_max_dd = (cum_returns / cum_returns.cummax() - 1).min()

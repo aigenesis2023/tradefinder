@@ -587,8 +587,25 @@ class PerformanceMetricsCalculator:
 
         returns_clean = returns.dropna()
         n = len(returns_clean)
-        n_years = n / TRADING_DAYS_PER_YEAR
-        n_years = max(n_years, 1 / TRADING_DAYS_PER_YEAR)
+
+        # Derive n_years from actual calendar span (not observation count).
+        # This is critical when returns are multi-day holding period returns
+        # rather than daily returns. Use observation count fallback if index
+        # is not datetime.
+        if n >= 2 and hasattr(returns_clean.index, 'to_series'):
+            try:
+                calendar_days = (returns_clean.index[-1] - returns_clean.index[0]).days
+                n_years = max(calendar_days / 365.25, 1 / TRADING_DAYS_PER_YEAR)
+                # Infer average period length for vol annualization
+                avg_period_days = calendar_days / max(n - 1, 1)
+                periods_per_year = max(TRADING_DAYS_PER_YEAR / avg_period_days, 1.0)
+                ann_vol_factor = np.sqrt(periods_per_year)
+            except (TypeError, AttributeError):
+                n_years = max(n / TRADING_DAYS_PER_YEAR, 1 / TRADING_DAYS_PER_YEAR)
+                ann_vol_factor = np.sqrt(TRADING_DAYS_PER_YEAR)
+        else:
+            n_years = max(n / TRADING_DAYS_PER_YEAR, 1 / TRADING_DAYS_PER_YEAR)
+            ann_vol_factor = np.sqrt(TRADING_DAYS_PER_YEAR)
 
         daily_rf = self.risk_free_rate / TRADING_DAYS_PER_YEAR
         excess_returns = returns_clean - daily_rf
@@ -596,12 +613,12 @@ class PerformanceMetricsCalculator:
         # Annualized return and volatility
         total_return = (1 + returns_clean).prod() - 1
         ann_return = (1 + total_return) ** (1 / n_years) - 1
-        ann_vol = returns_clean.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+        ann_vol = returns_clean.std() * ann_vol_factor
 
-        # Downside volatility
+        # Downside volatility (using same period-aware factor)
         downside_returns = returns_clean[returns_clean < 0]
         ann_downside_vol = (
-            downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+            downside_returns.std() * ann_vol_factor
             if len(downside_returns) > 1
             else ann_vol
         )
@@ -613,14 +630,14 @@ class PerformanceMetricsCalculator:
         # Sortino ratio
         sortino = excess_ann_return / ann_downside_vol if ann_downside_vol > 0 else 0.0
 
-        # Information ratio
+        # Information ratio (using period-aware annualization)
         ir = 0.0
         if benchmark_returns is not None:
             bench_aligned = benchmark_returns.reindex(returns_clean.index).dropna()
             if len(bench_aligned) > 0:
                 active_returns = returns_clean.loc[bench_aligned.index] - bench_aligned
                 ir = (
-                    active_returns.mean() / active_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+                    active_returns.mean() / active_returns.std() * ann_vol_factor
                     if active_returns.std() > 0
                     else 0.0
                 )
@@ -662,9 +679,10 @@ class PerformanceMetricsCalculator:
             if len(aligned_returns) > 5:
                 ic = aligned_signals.corr(aligned_returns)
 
-        # Bootstrap CIs for Sharpe and mean return
+        # Bootstrap CIs for Sharpe and mean return (using period-aware factor)
+        _ann_factor = ann_vol_factor  # capture for lambda
         sharpe_func = lambda x: (
-            (np.mean(x) - daily_rf) / np.std(x, ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR)
+            (np.mean(x) - daily_rf) / np.std(x, ddof=1) * _ann_factor
             if np.std(x, ddof=1) > 0
             else 0.0
         )

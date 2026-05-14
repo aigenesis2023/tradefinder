@@ -44,14 +44,19 @@ SEC_BASE = "https://www.sec.gov"
 SEC_ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
 SEC_SUBMISSIONS_API = "https://data.sec.gov/submissions"
 
-# User-Agent required by SEC (rate-limit/block without proper identification)
-SEC_USER_AGENT = "TradeFinder/1.0.0 (research@example.com)"
+# User-Agent required by SEC (rate-limit/block without proper identification).
+# Override with SEC_USER_AGENT env var for production use.
+_SEC_UA = os.environ.get("SEC_USER_AGENT", "")
+SEC_USER_AGENT = _SEC_UA if _SEC_UA else "TradeFinder/1.0.0 (contact via SEC_USER_AGENT env var)"
 
 # Rate limiting: SEC allows 10 requests/second
 SEC_RATE_LIMIT_DELAY = 0.12
 
-# Maximum number of filings to download per ticker per query
-MAX_FILINGS_PER_TICKER = 20
+# Maximum number of filings to download per ticker per query.
+# Set to 4 (last year of quarterly filings) to keep single-threaded
+# runs practical. For production: use parallel downloads or pre-built
+# filing database. SEC filing text is 1-30MB each, download-bound.
+MAX_FILINGS_PER_TICKER = 4
 
 
 class SECEdgarAdapter(DataAdapter):
@@ -90,16 +95,17 @@ class SECEdgarAdapter(DataAdapter):
             if os.path.exists(self._ticker_name_cache_path):
                 with open(self._ticker_name_cache_path) as f:
                     self._ci_k_mapping = json.load(f)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"CIK cache corrupted, will rebuild: {e}")
+            self._ci_k_mapping = {}
 
     def _save_cik_cache(self):
         """Persist CIK→ticker mapping."""
         try:
             with open(self._ticker_name_cache_path, "w") as f:
                 json.dump(self._ci_k_mapping, f)
-        except Exception:
-            pass
+        except (IOError, OSError) as e:
+            logger.warning(f"Failed to save CIK cache: {e}")
 
     def health_check(self) -> Tuple[bool, str]:
         """Check if SEC EDGAR is accessible."""
@@ -173,6 +179,11 @@ class SECEdgarAdapter(DataAdapter):
             )
 
         df = pd.DataFrame(filings)
+        # Drop full_text to control memory — the extractor uses section
+        # columns (mda_text, risk_factors_text, business_text), not full_text.
+        # Full 10-K/10-Q text is 10-30MB per filing; sections are ~100KB-2MB.
+        df.drop(columns=["full_text"], inplace=True, errors="ignore")
+
         logger.info(
             f"SEC EDGAR adapter acquired {len(df)} filings "
             f"for {df['ticker'].nunique()} tickers ({spec.start_date} to {spec.end_date})"
@@ -290,9 +301,13 @@ class SECEdgarAdapter(DataAdapter):
             if not filing_text:
                 continue
 
-            # Extract sections
-            sections = self._extract_filing_sections(filing_text, form)
-            clean_text = self._strip_html(filing_text)
+            # Get clean text (cached after first parse — skips BeautifulSoup
+            # on re-runs, which is the dominant cost at 5-15s per filing).
+            cache_key = f"{cik_stripped}_{acc.replace('-', '')}"
+            clean_text = self._get_or_make_clean_text(cache_key, filing_text)
+
+            # Extract sections from clean text (no double parse)
+            sections = self._extract_filing_sections_from_clean(clean_text, form)
 
             filings.append({
                 "cik": cik_stripped,
@@ -331,7 +346,8 @@ class SECEdgarAdapter(DataAdapter):
           /Archives/edgar/data/{CIK}/{acc_no_dashes}/{acc_no}.txt
 
         Falls back to the primary document if the full submission isn't
-        available as .txt.
+        available as .txt. Uses retry with exponential backoff for transient
+        network errors.
         """
         import requests
 
@@ -349,47 +365,95 @@ class SECEdgarAdapter(DataAdapter):
             f"{accession}.txt"
         )
 
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-            if resp.status_code == 200:
-                text = resp.text
-                # Only cache if it looks like a real filing
-                if len(text) > 1000 and "<SEC-DOCUMENT>" in text[:500]:
-                    self._cache_filing(cache_key, text)
-                    return text
+        text = self._fetch_url_with_retry(url, headers)
+        if text is not None:
+            if len(text) > 1000 and "<SEC-DOCUMENT>" in text[:500]:
+                self._cache_filing(cache_key, text)
+            return text
+
+        # Fallback: try the primary document directly
+        if primary_doc:
+            fallback_url = (
+                f"{SEC_ARCHIVES}/{cik_stripped}/{acc_no_dashes}/"
+                f"{primary_doc}"
+            )
+            text = self._fetch_url_with_retry(fallback_url, headers)
+            if text is not None and len(text) > 1000:
+                self._cache_filing(cache_key, text)
                 return text
-
-            # Fallback: try the primary document directly
-            if primary_doc:
-                fallback_url = (
-                    f"{SEC_ARCHIVES}/{cik_stripped}/{acc_no_dashes}/"
-                    f"{primary_doc}"
-                )
-                resp2 = requests.get(fallback_url, headers=headers, timeout=60)
-                if resp2.status_code == 200:
-                    text = resp2.text
-                    if len(text) > 1000:
-                        self._cache_filing(cache_key, text)
-                        return text
-
-        except Exception as e:
-            logger.warning(f"Download failed for {accession}: {e}")
 
         return None
 
+    @staticmethod
+    def _fetch_url_with_retry(
+        url: str, headers: Dict[str, str], max_retries: int = 3, timeout: int = 60
+    ) -> Optional[str]:
+        """Fetch a URL with retry and exponential backoff.
+
+        Retries on network errors and 429/503 status codes.
+        """
+        import requests
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, headers=headers, timeout=timeout)
+                if resp.status_code == 200:
+                    return resp.text
+                elif resp.status_code in (429, 503):
+                    # Rate limited or server overload — back off
+                    wait = 2 ** attempt
+                    logger.debug(f"SEC {resp.status_code} for {url[-60:]}, retry in {wait}s")
+                    time.sleep(wait)
+                    continue
+                elif resp.status_code == 404:
+                    return None  # Not found, don't retry
+                else:
+                    logger.debug(f"SEC {resp.status_code} for {url[-60:]}")
+                    return None
+            except requests.exceptions.Timeout:
+                wait = 2 ** attempt
+                logger.debug(f"SEC timeout for {url[-60:]}, attempt {attempt + 1}/{max_retries}")
+                last_error = f"Timeout after {timeout}s"
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+            except requests.exceptions.ConnectionError as e:
+                wait = 2 ** attempt
+                logger.debug(f"SEC connection error for {url[-60:]}, attempt {attempt + 1}/{max_retries}")
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+            except Exception as e:
+                logger.debug(f"SEC fetch failed for {url[-60:]}: {e}")
+                return None
+
+        if last_error:
+            logger.warning(f"SEC fetch failed after {max_retries} retries: {last_error}")
+        return None
+
     # ------------------------------------------------------------------
-    # HTML stripping
+    # HTML stripping (with parsed-text cache)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _strip_html(text: str) -> str:
         """Strip HTML/SGML tags and return clean text.
 
-        Uses BeautifulSoup when available, falls back to regex.
+        Uses BeautifulSoup with lxml parser (fast C implementation, ~2-5x
+        faster than Python's built-in html.parser). Falls back to html.parser
+        if lxml is not installed, then to regex.
+        The result is NOT cached here — use _get_or_make_clean_text for
+        cache-aware access.
         """
         try:
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(text, "html.parser")
+            # Prefer lxml for speed; fall back to html.parser
+            parser = "lxml"
+            try:
+                import lxml  # noqa: F401
+            except ImportError:
+                parser = "html.parser"
+            soup = BeautifulSoup(text, parser)
             # Remove script and style elements
             for tag in soup(["script", "style", "meta", "link"]):
                 tag.decompose()
@@ -404,6 +468,33 @@ class SECEdgarAdapter(DataAdapter):
         clean = re.sub(r"[ \t]+", " ", clean)
         clean = re.sub(r"\n{3,}", "\n\n", clean)
         return clean.strip()
+
+    def _get_or_make_clean_text(self, cache_key: str, raw_text: str) -> str:
+        """Return clean (HTML-stripped) text, using cache when available.
+
+        BeautifulSoup parsing of 10-30MB HTML is the dominant cost in
+        the adapter (~5-15s per filing). This second-level cache skips
+        re-parsing on re-runs.
+        """
+        clean_path = os.path.join(self._cache_dir, f"{cache_key}.clean.txt")
+
+        # Cache hit — read pre-parsed clean text
+        if os.path.exists(clean_path):
+            try:
+                with open(clean_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                pass
+
+        # Cache miss — parse and store
+        clean = self._strip_html(raw_text)
+        try:
+            with open(clean_path, "w", encoding="utf-8") as f:
+                f.write(clean)
+        except Exception as e:
+            logger.debug(f"Failed to cache clean text: {e}")
+
+        return clean
 
     # ------------------------------------------------------------------
     # Section extraction
@@ -442,7 +533,20 @@ class SECEdgarAdapter(DataAdapter):
     def _extract_filing_sections(
         cls, raw_text: str, form_type: str
     ) -> Dict[str, str]:
-        """Extract key sections from a filing's raw text.
+        """Extract key sections from a filing's raw HTML/SGML text.
+
+        Convenience wrapper — strips HTML then delegates to the clean-text
+        extractor. Prefer _extract_filing_sections_from_clean when you
+        already have clean text.
+        """
+        clean = cls._strip_html(raw_text)
+        return cls._extract_filing_sections_from_clean(clean, form_type)
+
+    @classmethod
+    def _extract_filing_sections_from_clean(
+        cls, clean_text: str, form_type: str
+    ) -> Dict[str, str]:
+        """Extract key sections from already-stripped clean text.
 
         Section headers appear twice in SEC filings: once in the Table of
         Contents (early in the document) and once in the body. We use the
@@ -452,9 +556,6 @@ class SECEdgarAdapter(DataAdapter):
                   Item 1 (Business), Item 7A (Market Risk).
         For 10-Q: Part II Item 1A (Risk Factors), Item 2 (MD&A).
         """
-        # Strip HTML for section boundary detection
-        clean = cls._strip_html(raw_text)
-
         form_upper = form_type.upper() if form_type else ""
         if "10-K" not in form_upper and "10-Q" not in form_upper:
             return {}
@@ -464,7 +565,7 @@ class SECEdgarAdapter(DataAdapter):
         for section_name, pattern in cls.SECTION_PATTERNS.items():
             # Find ALL occurrences — the last one is the body section
             # (the first is usually in the Table of Contents)
-            all_matches = list(pattern.finditer(clean))
+            all_matches = list(pattern.finditer(clean_text))
             if not all_matches:
                 continue
 
@@ -473,15 +574,15 @@ class SECEdgarAdapter(DataAdapter):
             start = match.start()
 
             # Find the next section heading after this body section
-            remaining = clean[match.end():]
+            remaining = clean_text[match.end():]
             next_match = cls._NEXT_SECTION.search(remaining)
             if next_match:
                 end = match.end() + next_match.start()
             else:
                 # Take up to 100KB after the heading
-                end = min(start + 100000, len(clean))
+                end = min(start + 100000, len(clean_text))
 
-            section_text = clean[start:end].strip()
+            section_text = clean_text[start:end].strip()
             if len(section_text) > 100:  # Sanity: real sections are > 100 chars
                 sections[section_name] = section_text
 

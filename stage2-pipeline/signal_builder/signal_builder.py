@@ -86,6 +86,11 @@ try:
         SurvivorshipBiasReport,
     )
     from signal_builder.trial_tracker import TrialTracker, create_trial_tracker
+    from signal_builder.universe_builder import (
+        UniverseBuilder,
+        UniverseBuildResult,
+        MIN_TICKERS_FOR_POWER,
+    )
 except ImportError:
     from .contamination import (
         ContaminationDetector,
@@ -97,6 +102,11 @@ except ImportError:
         SurvivorshipBiasReport,
     )
     from .trial_tracker import TrialTracker, create_trial_tracker
+    from .universe_builder import (
+        UniverseBuilder,
+        UniverseBuildResult,
+        MIN_TICKERS_FOR_POWER,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -171,15 +181,31 @@ class SignalBuilder:
         for ds in data_sources:
             provider_map.setdefault(ds.provider, []).append(ds)
 
-        # Inject universe tickers into data source metadata so adapters
-        # know which tickers to fetch (tickers live in universe, not in
-        # the data source spec, but adapters need them).
-        universe_tickers = hypothesis.universe.custom_tickers or []
-        if universe_tickers:
-            for specs in provider_map.values():
-                for spec in specs:
-                    if not spec.metadata.get("tickers"):
-                        spec.metadata["tickers"] = universe_tickers
+        # Step 2.5: Autonomous universe resolution
+        # If the hypothesis doesn't specify sufficient tickers, the
+        # UniverseBuilder derives the appropriate universe automatically
+        # from the hypothesis specification — no human input needed.
+        universe_result = self._resolve_universe(hypothesis)
+        universe_tickers = universe_result.tickers
+
+        logger.info(
+            f"  Universe: {universe_result.n_tickers} tickers "
+            f"(source={universe_result.source}, "
+            f"powered={universe_result.is_adequately_powered}, "
+            f"power={universe_result.achieved_power:.3f})"
+        )
+        if universe_result.warnings:
+            for w in universe_result.warnings:
+                logger.warning(f"  Universe warning: {w}")
+                warnings.append(f"[UNIVERSE] {w}")
+
+        # Inject resolved tickers into EVERY data source spec so adapters
+        # know which tickers to fetch.
+        for specs in provider_map.values():
+            for spec in specs:
+                spec.metadata["tickers"] = universe_tickers
+                spec.metadata["_universe_source"] = universe_result.source
+                spec.metadata["_universe_methodology"] = universe_result.methodology
 
         # Step 3: Acquire raw data from each adapter
         all_raw_data: Dict[str, RawData] = {}
@@ -308,9 +334,9 @@ class SignalBuilder:
                     )
 
             except Exception as e:
-                logger.warning(f"    Contamination detection failed (non-fatal): {e}")
+                logger.error(f"    Contamination detection FAILED: {e}", exc_info=True)
                 signal_data.metadata.warnings.append(
-                    f"[CONTAMINATION] Detection failed: {e}"
+                    f"[CONTAMINATION] DETECTION FAILED — contamination status UNKNOWN: {e}"
                 )
 
         # ==================================================================
@@ -359,9 +385,9 @@ class SignalBuilder:
                     )
 
             except Exception as e:
-                logger.warning(f"    Survivorship guard failed (non-fatal): {e}")
+                logger.error(f"    Survivorship guard FAILED: {e}", exc_info=True)
                 signal_data.metadata.warnings.append(
-                    f"[SURVIVORSHIP] Guard failed: {e}"
+                    f"[SURVIVORSHIP] GUARD FAILED — survivorship bias status UNKNOWN: {e}"
                 )
 
         # ==================================================================
@@ -386,10 +412,32 @@ class SignalBuilder:
                         f"({trial_count} submissions) reached."
                     )
             except Exception as e:
-                logger.debug(f"    Trial tracker note failed (non-fatal): {e}")
+                logger.error(f"    Trial tracker FAILED: {e}", exc_info=True)
 
         # Step 7: Save signal file
         signal_path = self._save_signal(hypothesis, signal_data)
+
+        # Save universe construction metadata (autonomous, auditable)
+        universe_meta = {
+            "source": universe_result.source,
+            "n_tickers": universe_result.n_tickers,
+            "tickers_sample": universe_result.tickers[:20],
+            "methodology": universe_result.methodology,
+            "required_observations": universe_result.required_observations,
+            "achievable_observations": universe_result.achievable_observations,
+            "is_adequately_powered": universe_result.is_adequately_powered,
+            "achieved_power": universe_result.achieved_power,
+            "frequency_recommendation": universe_result.frequency_recommendation,
+            "filing_types": universe_result.filing_types,
+            "warnings": universe_result.warnings,
+        }
+        universe_path = os.path.join(
+            self.output_dir, hypothesis.uuid,
+            f"{hypothesis.uuid}_universe.json",
+        )
+        os.makedirs(os.path.dirname(universe_path), exist_ok=True)
+        with open(universe_path, "w") as f:
+            json.dump(universe_meta, f, indent=2, default=str)
 
         # Save safeguards metadata alongside signal
         safeguards_meta = {
@@ -411,6 +459,47 @@ class SignalBuilder:
         logger.info(f"  Signal saved to: {signal_path}")
 
         return signal_path
+
+    def _resolve_universe(self, hypothesis: HypothesisSpec) -> UniverseBuildResult:
+        """Resolve the universe autonomously.
+
+        Uses custom tickers if the hypothesis provides them and they meet
+        the minimum threshold. Otherwise, constructs the universe from
+        available data sources (SEC EDGAR company_tickers.json).
+        """
+        try:
+            builder = UniverseBuilder(
+                cache_dir=self.cache_dir,
+                min_tickers=MIN_TICKERS_FOR_POWER,
+            )
+            return builder.build(hypothesis)
+        except Exception as e:
+            logger.warning(
+                f"UniverseBuilder failed ({e}); falling back to custom tickers"
+            )
+            custom = hypothesis.universe.custom_tickers or []
+            if not custom:
+                raise UntestableHypothesisError(
+                    hypothesis_uuid=hypothesis.uuid,
+                    reason=(
+                        f"Universe construction failed and no custom tickers "
+                        f"provided. Error: {e}"
+                    ),
+                    data_gap="Universe tickers",
+                ) from e
+            return UniverseBuildResult(
+                tickers=custom,
+                n_tickers=len(custom),
+                source="custom_fallback",
+                required_observations=0,
+                achievable_observations=0,
+                is_adequately_powered=False,
+                achieved_power=0.0,
+                frequency_recommendation="from_hypothesis",
+                filing_types=[],
+                methodology=f"Fallback to {len(custom)} custom tickers after UniverseBuilder error",
+                warnings=[f"UniverseBuilder failed: {e}"],
+            )
 
     def _determine_extractor(self, hypothesis: HypothesisSpec) -> str:
         """Determine which extractor to use based on the hypothesis's data sources.

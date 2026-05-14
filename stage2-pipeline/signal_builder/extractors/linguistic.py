@@ -548,8 +548,10 @@ class LinguisticExtractor(SignalExtractor):
                 feats.sentiment_positive = scores.get("pos", 0.0)
                 feats.sentiment_negative = scores.get("neg", 0.0)
                 feats.sentiment_neutral = scores.get("neu", 0.0)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"VADER sentiment failed for text: {e}. "
+                               "Sentiment scores will be zero. "
+                               "Install vaderSentiment: pip install vaderSentiment")
 
         return feats
 
@@ -563,7 +565,12 @@ class LinguisticExtractor(SignalExtractor):
         Currently supported: BRLAS (Benefit-Risk Linguistic Asymmetry Score).
 
         BRLAS = (HedgeBenefit - HedgeRisk) + (CertaintyRisk - CertaintyBenefit)
-                + 0.5 * (ReadabilityBenefit - ReadabilityRisk)
+                + 0.5 * (ReadabilityBenefit - ReadabilityRisk) / 100
+
+        The 0.5 weight on readability difference reflects that readability is a
+        secondary signal compared to hedging/certainty density. The /100 divisor
+        normalizes Flesch Reading Ease (0-100 scale) to roughly the same order
+        of magnitude as density scores (0.0-1.0).
         """
         if composite_name == "brlas":
             benefit = section_features.get("benefit", LinguisticFeatures())

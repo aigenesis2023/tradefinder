@@ -492,13 +492,6 @@ class HypothesisPipeline:
                 parameters=asdict(hypothesis.universe),
             )
             self._stage_results[stage] = {"n_tickers": self.universe_df["ticker"].nunique()}
-
-            # --- SAFEGUARD: Survivorship Bias Guard ---
-            if self.enable_survivorship_guard:
-                try:
-                    self._run_survivorship_guard()
-                except Exception as e:
-                    self._warnings.append(f"Survivorship guard failed (non-fatal): {e}")
         except Exception as e:
             self._capture_stage_error(stage, e)
             return self._finalize_verdict(
@@ -529,6 +522,15 @@ class HypothesisPipeline:
                 parameters={"start": hypothesis.time_period.start_date,
                             "end": hypothesis.time_period.end_date},
             )
+
+            # --- SAFEGUARD: Survivorship Bias Guard ---
+            # Runs after signal/data loading so the guard sees the same tickers
+            # and signal data that the backtest will use.
+            if self.enable_survivorship_guard:
+                try:
+                    self._run_survivorship_guard()
+                except Exception as e:
+                    self._warnings.append(f"Survivorship guard failed (non-fatal): {e}")
         except Exception as e:
             self._capture_stage_error(stage, e)
             return self._finalize_verdict(
@@ -764,44 +766,77 @@ class HypothesisPipeline:
         bias_report = uconstructor.get_bias_report()
         self._warnings.extend(uconstructor.warnings)
 
-        # If universe is empty (e.g., no API keys available), fall back to
-        # simulated universe for pipeline testing. In production, missing
-        # data must be reported as UNTESTABLE, not silently simulated.
+        # If universe is empty, check if a pre-computed signal file can
+        # provide the ticker list (signal columns define the universe).
         if df.empty or "ticker" not in df.columns:
-            self._warnings.append(
-                "UNIVERSE EMPTY: No real-ticker data available. Using simulated "
-                "universe for pipeline testing. REAL HYPOTHESES REQUIRE LIVE DATA."
-            )
-            tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "BRK-B",
-                       "JPM", "V", "JNJ", "WMT", "PG", "XOM", "UNH", "HD",
-                       "MA", "BAC", "DIS", "NFLX", "ADBE"]
-            dates = pd.date_range(
-                self.hypothesis.time_period.start_date,
-                self.hypothesis.time_period.end_date,
-                freq="B",
-            )
-            records = []
-            for date in dates:
-                date_str = date.strftime("%Y-%m-%d")
-                for ticker in tickers:
-                    records.append({
-                        "date": date_str,
-                        "ticker": ticker,
-                        "entity_id": ticker,
-                        "company_name": ticker,
-                        "cik": "",
-                        "cusip": "",
-                        "market_cap": 1e10,
-                        "sector": "Technology",
-                        "price": 100.0,
-                        "volume": 1e7,
-                        "dollar_volume": 1e9,
-                        "index_member": False,
-                        "is_delisted": False,
-                        "delisting_date": None,
-                        "delisting_return": None,
-                    })
-            df = pd.DataFrame(records)
+            signal_src = self.hypothesis.signal.signal_source
+            if signal_src and os.path.exists(signal_src):
+                logger.info(
+                    f"Universe empty but signal file found: {signal_src}. "
+                    "Deriving universe from signal columns."
+                )
+                try:
+                    if signal_src.endswith(".parquet"):
+                        signal_df = pd.read_parquet(signal_src)
+                    elif signal_src.endswith(".csv"):
+                        signal_df = pd.read_csv(signal_src, index_col=0, parse_dates=True)
+                    else:
+                        raise PipelineError(f"Unknown signal format: {signal_src}")
+
+                    tickers = list(signal_df.columns) if not signal_df.empty else []
+                    if tickers:
+                        logger.info(
+                            f"Signal-derived universe: {len(tickers)} tickers"
+                        )
+                        # Build a minimal universe from signal tickers
+                        dates = pd.date_range(
+                            self.hypothesis.time_period.start_date,
+                            self.hypothesis.time_period.end_date,
+                            freq="B",
+                        )
+                        records = []
+                        for date in dates:
+                            for ticker in tickers:
+                                records.append({
+                                    "date": date,
+                                    "ticker": ticker,
+                                    "entity_id": ticker,
+                                    "company_name": ticker,
+                                    "cik": "",
+                                    "cusip": "",
+                                    "market_cap": None,
+                                    "sector": "Unknown",
+                                    "price": None,
+                                    "volume": None,
+                                    "dollar_volume": None,
+                                    "index_member": False,
+                                    "is_delisted": False,
+                                    "delisting_date": None,
+                                    "delisting_return": None,
+                                })
+                        df = pd.DataFrame(records)
+                        self._warnings.append(
+                            "Universe derived from pre-computed signal tickers "
+                            "(not independently constructed)."
+                        )
+                    else:
+                        raise PipelineError(
+                            "UNIVERSE EMPTY: No real-ticker data available and "
+                            "signal file has no columns. Check data availability."
+                        )
+                except PipelineError:
+                    raise
+                except Exception as e:
+                    raise PipelineError(
+                        f"UNIVERSE EMPTY: No real-ticker data available and "
+                        f"failed to derive from signal: {e}"
+                    ) from e
+            else:
+                raise PipelineError(
+                    "UNIVERSE EMPTY: No real-ticker data available. "
+                    "Check data availability and API keys. "
+                    "The pipeline requires real market data for hypothesis testing."
+                )
 
         n_tickers = df["ticker"].nunique() if "ticker" in df.columns else 0
         logger.info(
@@ -897,9 +932,10 @@ class HypothesisPipeline:
         """
         Load market data (prices, signals) from specified sources.
 
-        In production this connects to Yahoo Finance, FMP, SEC EDGAR, etc.
-        For the locked pipeline, it also supports loading pre-computed signal
-        files and simulated data for testing.
+        When a pre-computed signal file is loaded, its tickers become the
+        authoritative universe. The pipeline must use those tickers for price
+        loading — not an independently constructed universe that may differ
+        from what the signal builder used.
         """
         hyp = self.hypothesis
         prices = None
@@ -907,29 +943,9 @@ class HypothesisPipeline:
         market_caps = None
         volumes = None
 
-        # --- Load price data ---
-        price_sources = [ds for ds in hyp.data_sources if ds.source_type == "price"]
-        if price_sources:
-            # Attempt to load from Yahoo Finance or local cache
-            tickers = self.universe_df["ticker"].unique().tolist() if self.universe_df is not None else []
-            try:
-                prices = self._load_prices_yahoo(tickers, hyp.time_period.start_date, hyp.time_period.end_date)
-            except Exception as e:
-                logger.warning(f"Yahoo Finance price load failed: {e}. Creating simulated data.")
-                prices = self._simulate_price_data(
-                    tickers, hyp.time_period.start_date, hyp.time_period.end_date
-                )
-
-        if prices is None:
-            # Fallback: simulate price data from universe
-            tickers = self.universe_df["ticker"].unique().tolist() if self.universe_df is not None else []
-            prices = self._simulate_price_data(
-                tickers, hyp.time_period.start_date, hyp.time_period.end_date
-            )
-
-        # --- Load signal data ---
+        # --- Load signal data FIRST (to derive universe tickers) ---
+        signal_tickers: Optional[List[str]] = None
         if hyp.signal.signal_source and os.path.exists(hyp.signal.signal_source):
-            # Load pre-computed signal from file
             path = hyp.signal.signal_source
             if path.endswith(".parquet"):
                 signals = pd.read_parquet(path)
@@ -938,13 +954,52 @@ class HypothesisPipeline:
             else:
                 raise PipelineError(f"Unknown signal file format: {path}")
             logger.info(f"Loaded signals from {path}: {signals.shape}")
+
+            # Signal columns define the authoritative universe for this test.
+            # The signal builder already chose these tickers autonomously;
+            # the pipeline must use them, not construct an independent universe.
+            signal_tickers = list(signals.columns) if not signals.empty else []
+            if signal_tickers:
+                logger.info(
+                    f"Signal-derived universe: {len(signal_tickers)} tickers "
+                    f"(overriding independently-constructed universe)"
+                )
+                self._rebuild_universe_from_signal_tickers(signal_tickers)
         else:
-            # No pre-computed signal; create an empty signal df (backtest will fail gracefully)
             logger.warning(
                 "No signal source provided. Pipeline requires either a signal_source file "
                 "or a signal_function callable to produce signals."
             )
             signals = pd.DataFrame()
+
+        # --- Load price data ---
+        # Use signal tickers if available; otherwise fall back to universe tickers
+        if signal_tickers:
+            price_tickers = signal_tickers
+        else:
+            price_tickers = (
+                self.universe_df["ticker"].unique().tolist()
+                if self.universe_df is not None and not self.universe_df.empty
+                else []
+            )
+
+        price_sources = [ds for ds in hyp.data_sources if ds.source_type == "price"]
+        if price_sources and price_tickers:
+            try:
+                prices = self._load_prices_yahoo(
+                    price_tickers, hyp.time_period.start_date, hyp.time_period.end_date
+                )
+            except Exception as e:
+                raise PipelineError(
+                    f"Yahoo Finance price data load failed for {len(price_tickers)} tickers: {e}. "
+                    "Real price data is required for hypothesis testing."
+                ) from e
+
+        if prices is None and price_tickers:
+            raise PipelineError(
+                f"No price data available for {len(price_tickers)} tickers. "
+                "Real price data is required for hypothesis testing."
+            )
 
         return {
             "prices": prices,
@@ -952,6 +1007,74 @@ class HypothesisPipeline:
             "market_caps": market_caps,
             "volumes": volumes,
         }
+
+    def _rebuild_universe_from_signal_tickers(self, tickers: List[str]) -> None:
+        """Rebuild universe DataFrame from signal-derived tickers.
+
+        When a pre-computed signal is loaded, its columns define the
+        universe. This replaces the independently-constructed universe
+        to ensure signal, prices, and universe are all aligned.
+
+        Preserves real metadata from the original universe when available,
+        rather than using hardcoded placeholders.
+        """
+        hyp = self.hypothesis
+        dates = pd.date_range(
+            hyp.time_period.start_date,
+            hyp.time_period.end_date,
+            freq="B",
+        )
+
+        # Build lookup from original universe (if available) to preserve real metadata
+        ticker_meta: Dict[str, Dict[str, Any]] = {}
+        if self.universe_df is not None and not self.universe_df.empty:
+            for ticker in tickers:
+                ticker_rows = self.universe_df[self.universe_df["ticker"] == ticker]
+                if not ticker_rows.empty:
+                    row = ticker_rows.iloc[0]
+                    ticker_meta[ticker] = {
+                        "entity_id": row.get("entity_id", ticker),
+                        "company_name": row.get("company_name", ticker),
+                        "cik": row.get("cik", ""),
+                        "cusip": row.get("cusip", ""),
+                        "market_cap": row.get("market_cap", None),
+                        "sector": row.get("sector", "Unknown"),
+                        "index_member": row.get("index_member", False),
+                        "is_delisted": row.get("is_delisted", False),
+                        "delisting_date": row.get("delisting_date", None),
+                        "delisting_return": row.get("delisting_return", None),
+                    }
+
+        records = []
+        for date in dates:
+            for ticker in tickers:
+                meta = ticker_meta.get(ticker, {})
+                records.append({
+                    "date": date,
+                    "ticker": ticker,
+                    "entity_id": meta.get("entity_id", ticker),
+                    "company_name": meta.get("company_name", ticker),
+                    "cik": meta.get("cik", ""),
+                    "cusip": meta.get("cusip", ""),
+                    "market_cap": meta.get("market_cap", None),
+                    "sector": meta.get("sector", "Unknown"),
+                    "price": None,
+                    "volume": None,
+                    "dollar_volume": None,
+                    "index_member": meta.get("index_member", False),
+                    "is_delisted": meta.get("is_delisted", False),
+                    "delisting_date": meta.get("delisting_date", None),
+                    "delisting_return": meta.get("delisting_return", None),
+                })
+        self.universe_df = pd.DataFrame(records)
+        logger.info(
+            f"Universe rebuilt from signal tickers: {len(tickers)} tickers, "
+            f"{len(self.universe_df)} total observations"
+        )
+        self._warnings.append(
+            "Universe derived from pre-computed signal tickers "
+            "(not independently constructed)."
+        )
 
     def _load_prices_yahoo(self, tickers: List[str], start: str, end: str) -> pd.DataFrame:
         """
@@ -972,16 +1095,17 @@ class HypothesisPipeline:
         if data is None:
             raise PipelineError("Yahoo Finance returned None.")
 
-        # yfinance returns MultiIndex columns for multi-ticker downloads
+        # yfinance returns MultiIndex columns for multi-ticker downloads.
+        # .columns.names gives level names (e.g. ['Price', 'Ticker']), NOT
+        # level values. Use .get_level_values(0) to check for 'Adj Close'.
         if isinstance(data.columns, pd.MultiIndex):
-            # Extract 'Adj Close' or 'Close' column across all tickers
-            if "Adj Close" in data.columns.names:
+            first_level = data.columns.get_level_values(0)
+            if "Adj Close" in first_level:
                 prices = data.xs("Adj Close", axis=1, level=0)
-            elif "Close" in data.columns.names:
+            elif "Close" in first_level:
                 prices = data.xs("Close", axis=1, level=0)
             else:
-                # Take the first level
-                prices = data.xs(data.columns.levels[0][0], axis=1, level=0)
+                prices = data.xs(first_level[0], axis=1, level=0)
         else:
             # Single ticker or different format
             if "Adj Close" in data.columns:
@@ -1070,24 +1194,43 @@ class HypothesisPipeline:
                 data_type=dtype,
             )
 
-        # Check signal dates against known dates
+        # Check signal dates against known dates using PIT dataset
         n_breaches = 0
         is_valid = True
 
         if self.signal_df is not None and not self.signal_df.empty:
-            # For each date in the signal index, verify it has a known_date
-            # that is <= signal date (i.e., no forward-looking data)
-            signal_dates = self.signal_df.index.tolist()
-            signal_dates_str = [str(d) if hasattr(d, 'strftime') else d for d in signal_dates]
+            # Build a point-in-time dataset to verify no look-ahead
+            try:
+                pit_df = builder.build_pit_dataset(
+                    data_sources={
+                        "signals": self.signal_df,
+                    },
+                    start_date=self.hypothesis.time_period.start_date,
+                    end_date=self.hypothesis.time_period.end_date,
+                )
 
-            # If we have raw data with timestamps, build PIT dataset and scan
-            # For now, report that temporal check was performed
+                if pit_df is not None and not pit_df.empty:
+                    breaches = builder.check_look_ahead_breaches(pit_df)
+                    n_breaches = len(breaches)
+                    is_valid = n_breaches == 0
+                    if not is_valid:
+                        warnings_list.append(
+                            f"TEMPORAL BREACH: {n_breaches} look-ahead breaches detected. "
+                            "Signal uses data not yet known at observation date."
+                        )
+            except Exception as e:
+                warnings_list.append(
+                    f"Temporal PIT check could not be completed: {e}. "
+                    "Ensure signal construction uses only data known at each date."
+                )
+
             n_observations = len(self.signal_df) * len(self.signal_df.columns)
-            warnings_list.append(
-                "Temporal alignment: Using signal dates as observation dates. "
-                "Ensure that signal construction uses only data known at each date "
-                "(no look-ahead)."
-            )
+            if is_valid:
+                warnings_list.append(
+                    "Temporal alignment: Using signal dates as observation dates. "
+                    "Ensure that signal construction uses only data known at each date "
+                    "(no look-ahead)."
+                )
         else:
             n_observations = 0
 
@@ -1175,21 +1318,15 @@ class HypothesisPipeline:
     def _make_fallback_signals(self) -> pd.DataFrame:
         """Create a fallback signal DataFrame when none is provided.
 
-        Uses random signals for pipeline testing. In production, signals
-        come from the hypothesis specification."""
-        if self.price_df is None:
-            raise PipelineError("Cannot create fallback signals: no price data available.")
-
-        rng = np.random.RandomState(self.seeds["global"])
-        signals = pd.DataFrame(
-            rng.randn(*self.price_df.shape),
-            index=self.price_df.index,
-            columns=self.price_df.columns,
+        Raises PipelineError — random signals are never acceptable for
+        hypothesis testing. A real signal source must be provided.
+        """
+        raise PipelineError(
+            "No signal data available. A signal source (pre-computed from "
+            "the signal builder) is required for hypothesis testing. "
+            "Run the signal builder first, or use run_loop.py which "
+            "orchestrates signal construction automatically."
         )
-        self._warnings.append(
-            "USING RANDOM FALLBACK SIGNALS. Real hypothesis MUST provide actual signals."
-        )
-        return signals
 
     def _extract_backtest_summary(self) -> Dict[str, Any]:
         """Extract key metrics from the backtest result."""

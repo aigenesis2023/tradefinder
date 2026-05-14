@@ -1,16 +1,15 @@
 """
-yahoo_finance.py — Yahoo Finance Data Adapter
-=============================================
+yahoo_finance.py — Yahoo Finance Price Data Adapter
+====================================================
 
-Acquires price, volume, and fundamental data via yfinance.
+Acquires historical price data (OHLCV) for US equities from Yahoo Finance
+via the yfinance library.
 
-Data sources (free but with limitations):
-  - Yahoo Finance (via yfinance library)
-  - Known biases: survivorship bias pre-2017, no historical index constituents,
-    corporate actions may lag 1-2 days
+Data: Free, retail-accessible. No API key required.
+Known limitation: survivorship bias for stocks delisted before ~2017.
 
-Status: FUNCTIONAL SKELETON — price acquisition works end-to-end.
-  For real pipeline runs, yfinance is the primary free price data source.
+Caching: Per-ticker price data is cached as parquet files. Subsequent runs
+for the same ticker+date range use cached data, not re-downloaded.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from ..base import (
@@ -38,15 +38,13 @@ logger = logging.getLogger(__name__)
 
 
 class YahooFinanceAdapter(DataAdapter):
-    """Acquire price and fundamental data from Yahoo Finance.
+    """Acquire historical price data from Yahoo Finance via yfinance.
 
-    Supports:
-    - Historical price data (OHLCV) via yfinance
-    - Dividend and split data
-    - Basic fundamental data (market cap, P/E, etc.)
+    Known limitation: yfinance may not return data for stocks delisted
+    before ~2017, introducing survivorship bias. The SurvivorshipGuard
+    in the pipeline flags this limitation.
 
-    All data is free but has known survivorship bias for stocks delisted
-    before approximately 2017.
+    Caching is enabled by default to avoid re-downloading on re-runs.
     """
 
     @property
@@ -55,12 +53,13 @@ class YahooFinanceAdapter(DataAdapter):
 
     @property
     def version(self) -> str:
-        return "1.0.0"
+        return "2.0.0"
 
     def __init__(self, cache_dir: Optional[str] = None):
         self._cache_dir = cache_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "_cache", "yahoo"
         )
+        os.makedirs(self._cache_dir, exist_ok=True)
 
     def health_check(self) -> Tuple[bool, str]:
         """Check if yfinance is available."""
@@ -73,11 +72,7 @@ class YahooFinanceAdapter(DataAdapter):
     def acquire(self, spec: DataSourceSpec) -> RawData:
         """Acquire price data for specified tickers and date range.
 
-        Args:
-            spec: DataSourceSpec with tickers in metadata or custom_tickers field.
-
-        Returns:
-            RawData with price records.
+        Caches per-ticker data as parquet files to avoid re-downloading.
         """
         try:
             import yfinance as yf
@@ -96,29 +91,13 @@ class YahooFinanceAdapter(DataAdapter):
                 missing_data="Ticker list for price data",
             )
 
-        if len(tickers) > 50:
-            logger.warning(
-                f"Downloading data for {len(tickers)} tickers; yfinance may be slow. "
-                f"Consider splitting into batches."
-            )
-
         logger.info(f"Downloading Yahoo Finance data for {len(tickers)} tickers...")
-        all_data = []
 
-        for i, ticker in enumerate(tickers):
-            try:
-                tkr = yf.Ticker(ticker)
-                hist = tkr.history(
-                    start=spec.start_date,
-                    end=spec.end_date,
-                    auto_adjust=True,
-                )
-                if not hist.empty:
-                    hist["ticker"] = ticker
-                    hist.index.name = "date"
-                    all_data.append(hist.reset_index())
-            except Exception as e:
-                logger.warning(f"Failed to download {ticker}: {e}")
+        # Use parallel download pool for 10+ tickers
+        if len(tickers) >= 10:
+            all_data = self._download_parallel(tickers, spec, yf)
+        else:
+            all_data = self._download_sequential(tickers, spec, yf)
 
         if not all_data:
             raise DataAcquisitionError(
@@ -143,6 +122,80 @@ class YahooFinanceAdapter(DataAdapter):
                 "date_range": f"{spec.start_date} to {spec.end_date}",
             },
         )
+
+    def _download_sequential(
+        self, tickers: List[str], spec: DataSourceSpec, yf
+    ) -> List[pd.DataFrame]:
+        """Download tickers one at a time (for small batches)."""
+        all_data = []
+        for ticker in tickers:
+            hist = self._get_ticker_history(ticker, spec, yf)
+            if hist is not None:
+                all_data.append(hist)
+        return all_data
+
+    def _download_parallel(
+        self, tickers: List[str], spec: DataSourceSpec, yf
+    ) -> List[pd.DataFrame]:
+        """Download tickers in parallel using a thread pool."""
+        try:
+            from ..download_pool import DownloadPool
+        except ImportError:
+            # Fall back to sequential if download_pool unavailable
+            return self._download_sequential(tickers, spec, yf)
+
+        def fetch_one(ticker: str) -> Optional[pd.DataFrame]:
+            return self._get_ticker_history(ticker, spec, yf)
+
+        all_data = []
+        with DownloadPool(max_workers=8, rate_limit=20.0, retries=1) as pool:
+            results = pool.map(fetch_one, tickers, desc="Yahoo price downloads")
+            for r in results:
+                if r.success and r.result is not None:
+                    all_data.append(r.result)
+
+        return all_data
+
+    def _get_ticker_history(
+        self, ticker: str, spec: DataSourceSpec, yf
+    ) -> Optional[pd.DataFrame]:
+        """Get price history for a single ticker, with caching."""
+        cache_key = f"{ticker}_{spec.start_date}_{spec.end_date}"
+        cache_path = os.path.join(self._cache_dir, f"{cache_key}.parquet")
+
+        # Check cache
+        if os.path.exists(cache_path):
+            try:
+                cached = pd.read_parquet(cache_path)
+                if not cached.empty:
+                    return cached
+            except Exception:
+                pass  # Cache corrupt, re-download
+
+        # Download from Yahoo Finance
+        try:
+            tkr = yf.Ticker(ticker)
+            hist = tkr.history(
+                start=spec.start_date,
+                end=spec.end_date,
+                auto_adjust=True,
+            )
+            if not hist.empty:
+                hist["ticker"] = ticker
+                hist.index.name = "date"
+                result = hist.reset_index()
+
+                # Cache for future runs
+                try:
+                    result.to_parquet(cache_path, index=False)
+                except Exception:
+                    pass  # Non-critical: cache write failure
+
+                return result
+        except Exception as e:
+            logger.warning(f"Failed to download {ticker}: {e}")
+
+        return None
 
     def validate(self, raw_data: RawData) -> Tuple[bool, List[str]]:
         """Validate price data quality."""

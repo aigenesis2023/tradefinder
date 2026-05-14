@@ -478,8 +478,8 @@ class DistributionAnalyzer:
         mean = np.mean(returns_clean)
         median = np.median(returns_clean)
         std = np.std(returns_clean, ddof=1)
-        skew = stats.skew(returns_clean)
-        kurt = stats.kurtosis(returns_clean)  # Excess kurtosis
+        skew = stats.skew(returns_clean, bias=False)
+        kurt = stats.kurtosis(returns_clean, bias=False)  # Excess kurtosis
 
         # Min/max/percentiles
         min_val = np.min(returns_clean)

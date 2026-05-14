@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # SEC company_tickers.json endpoint — maps CIK to ticker for all filers
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_USER_AGENT = "TradeFinder/1.0.0 (research@example.com)"
+SEC_USER_AGENT = "TradeFinder aigenesis2023@github.com"
 SEC_RATE_LIMIT_DELAY = 0.12
 
 # Default universe constraints
@@ -293,6 +293,9 @@ class UniverseBuilder:
     def _fetch_company_tickers(self) -> Dict[str, Dict[str, Any]]:
         """Fetch all company tickers from SEC's company_tickers.json.
 
+        Uses local file cache to survive SEC rate-limiting/blocking.
+        Cache is refreshed when SEC API is reachable.
+
         Returns:
             Dict mapping uppercase ticker → {cik_str, ticker, title}
         """
@@ -304,13 +307,25 @@ class UniverseBuilder:
         if self._company_tickers is not None:
             return self._company_tickers
 
+        # Check local cache first
+        cache_path = os.path.join(self._cache_dir or ".", "company_tickers_cache.json")
+
+        def _load_from_file(path: str) -> Optional[Dict[str, Dict[str, Any]]]:
+            try:
+                if os.path.exists(path):
+                    with open(path, "r") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load ticker cache: {e}")
+            return None
+
+        # Try SEC API
         try:
             import requests
             headers = {"User-Agent": SEC_USER_AGENT}
             resp = requests.get(SEC_COMPANY_TICKERS_URL, headers=headers, timeout=30)
             if resp.status_code == 200:
                 raw = resp.json()
-                # Map by uppercase ticker
                 result: Dict[str, Dict[str, Any]] = {}
                 for cik_str, info in raw.items():
                     ticker = info.get("ticker", "").upper()
@@ -320,6 +335,12 @@ class UniverseBuilder:
                             "ticker": ticker,
                             "title": info.get("title", ""),
                         }
+                # Save to local cache
+                try:
+                    with open(cache_path, "w") as f:
+                        json.dump(result, f)
+                except Exception:
+                    pass
                 _CACHED_COMPANY_TICKERS = result
                 self._company_tickers = result
                 logger.info(f"Fetched {len(result)} tickers from SEC company_tickers.json")
@@ -328,6 +349,14 @@ class UniverseBuilder:
                 logger.warning(f"SEC company_tickers returned {resp.status_code}")
         except Exception as e:
             logger.warning(f"Failed to fetch SEC company tickers: {e}")
+
+        # Fall back to local cache
+        cached = _load_from_file(cache_path)
+        if cached:
+            logger.info(f"Using cached company tickers: {len(cached)} entries")
+            _CACHED_COMPANY_TICKERS = cached
+            self._company_tickers = cached
+            return cached
 
         return {}
 
@@ -338,13 +367,69 @@ class UniverseBuilder:
     ) -> List[str]:
         """Filter tickers based on derived scope.
 
-        Without exchange data (which would require per-ticker lookups),
-        we accept all SEC-registered tickers and log the scope.
+        Filters applied:
+        1. Remove tickers with non-standard formats (warrants, rights, units, >5 chars)
+        2. Sector keyword matching against company title from SEC data
+        3. Min market cap filter (when exchange/market data is unavailable, all pass)
         """
         tickers = list(all_tickers.keys())
+        n_before = len(tickers)
+
+        # 1. Remove non-standard tickers: warrants (.W, -W), rights (.R), units (.U),
+        #    and tickers with unusual characters or excessive length (likely not common stock).
+        def _is_standard_ticker(t: str) -> bool:
+            if len(t) > 5:
+                return False
+            if not t.replace("-", "").replace(".", "").isalpha():
+                return False
+            for suffix in (".W", "-W", ".R", "-R", ".U", "-U", ".A", "-A", " WS", " RT", " UN", " WI"):
+                if t.endswith(suffix):
+                    return False
+            return True
+
+        tickers = [t for t in tickers if _is_standard_ticker(t)]
+        n_after_format = len(tickers)
+        if n_after_format < n_before:
+            logger.info(f"  Removed {n_before - n_after_format} non-standard tickers (warrants/rights/units/etc.)")
+
+        # 2. Sector filter: match company title against sector keywords.
+        sectors = scope.get("sectors", [])
+        if sectors:
+            sector_keywords = {
+                "technology": ["tech", "software", "semiconductor", "computer", "data", "cyber",
+                               "internet", "digital", "electronic", "cloud", "network", "it ", "ai "],
+                "healthcare": ["health", "pharma", "bio", "medic", "therap", "drug", "clinic",
+                               "hospital", "diagnostic", "surgical", "genetic", "immun"],
+                "financial": ["bank", "financ", "insur", "invest", "capital", "credit", "loan",
+                              "mortgage", "broker", "asset management", "private equity", "hedge"],
+                "energy": ["energy", "oil", "gas", "petroleum", "solar", "wind", "power",
+                           "utility", "renewable", "pipeline", "drilling", "exploration"],
+                "consumer": ["retail", "consumer", "food", "beverage", "restaurant", "apparel",
+                             "auto", "hotel", "entertainment", "media", "gaming", "travel"],
+                "industrial": ["industr", "manufactur", "aerospace", "defense", "chemical",
+                               "construction", "engineering", "logistics", "transport", "machinery"],
+                "real_estate": ["real estate", "reit", "property", "realty", "homes"],
+                "materials": ["mining", "metal", "steel", "gold", "copper", "timber", "paper",
+                              "chemical", "plastics", "glass"],
+            }
+
+            sec_sectors_lower = [s.lower() for s in sectors]
+            to_keep = []
+            for t in tickers:
+                entry = all_tickers.get(t, {})
+                title = entry.get("title", "").lower()
+                for sec in sec_sectors_lower:
+                    keywords = sector_keywords.get(sec, [sec])
+                    if any(kw in title for kw in keywords):
+                        to_keep.append(t)
+                        break
+            tickers = to_keep
+            n_after_sector = len(tickers)
+            logger.info(f"  Sector filter ({sectors}): {n_after_format} → {n_after_sector} tickers")
+
         logger.info(
             f"Universe scope: {scope['description']} → "
-            f"{len(tickers)} tickers available from SEC"
+            f"{len(tickers)} tickers (from {n_before} SEC-registered)"
         )
         return sorted(tickers)
 
@@ -468,7 +553,8 @@ class UniverseBuilder:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
             return max(0.5, (e - s).days / 365.25)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to parse time horizon from hypothesis: {e}; defaulting to 3.0 years")
             return 3.0
 
     def _compute_feasible_max(

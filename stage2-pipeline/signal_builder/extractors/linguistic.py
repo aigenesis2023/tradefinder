@@ -363,13 +363,17 @@ class LinguisticExtractor(SignalExtractor):
         all_hedges = HEDGE_PHRASES + extra_hedges
         all_certainty = CERTAINTY_MARKERS + extra_certainty
 
-        # Compile regex patterns
+        # Compile regex patterns.
+        # Hedge phrases are pure word characters — use \b boundaries.
         hedge_pattern = re.compile(
             r'\b(' + '|'.join(re.escape(h.lower()) for h in all_hedges) + r')\b',
             re.IGNORECASE,
         )
+        # Certainty markers include phrases with non-word chars (p <, p =, 95% confidence,
+        # p-value). Use (?<!\w) ... (?!\w) instead of \b so the boundary assertion
+        # does not fail on non-word characters like '<', '=', '%', '-'.
         certainty_pattern = re.compile(
-            r'\b(' + '|'.join(re.escape(c.lower()) for c in all_certainty) + r')\b',
+            r'(?<!\w)(' + '|'.join(re.escape(c.lower()) for c in all_certainty) + r')(?!\w)',
             re.IGNORECASE,
         )
 
@@ -465,9 +469,27 @@ class LinguisticExtractor(SignalExtractor):
         """Extract all features from a single text string."""
         feats = LinguisticFeatures(section_label=section_label)
 
-        # Tokenize into sentences
-        sentences = re.split(r'[.!?]+', text)
-        sentences = [s.strip() for s in sentences if len(s.strip().split()) >= 3]
+        # Tokenize into sentences using nltk's punkt tokenizer if available,
+        # falling back to a regex splitter that avoids common abbreviations.
+        try:
+            import nltk
+            try:
+                sentences = nltk.sent_tokenize(text)
+            except LookupError:
+                nltk.download('punkt_tab', quiet=True)
+                sentences = nltk.sent_tokenize(text)
+        except ImportError:
+            # Fallback: split on sentence-ending punctuation followed by space+capital,
+            # avoiding splits on common abbreviations.
+            text_clean = re.sub(
+                r'\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|Inc|Ltd|Corp|Co|LLC|LLP|vs|etc|et\s+al|e\.g|i\.e|U\.S|p\.m|a\.m)\.',
+                lambda m: m.group(0).replace('.', '<DOT>'),
+                text,
+            )
+            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text_clean)
+            sentences = [s.replace('<DOT>', '.') for s in sentences if len(s.strip().split()) >= 3]
+        else:
+            sentences = [s.strip() for s in sentences if len(s.strip().split()) >= 3]
         feats.n_sentences = len(sentences)
 
         # Tokenize into words
@@ -650,10 +672,11 @@ class LinguisticExtractor(SignalExtractor):
                     break
 
         if date_col not in features_df.columns and date_col not in original_df.columns:
-            # No date column available, create a sequential date index
-            logger.warning("No date column found; creating sequential date index")
-            features_df["_date"] = pd.date_range("2020-01-01", periods=len(features_df), freq="B")
-            date_col = "_date"
+            raise SignalExtractionError(
+                "linguistic",
+                f"No date column found. Available columns: {list(features_df.columns)}. "
+                f"Cannot construct signal without date information.",
+            )
 
         # Merge date from original if needed
         if date_col not in features_df.columns and date_col in original_df.columns:
@@ -681,8 +704,12 @@ class LinguisticExtractor(SignalExtractor):
             if fallback_cols:
                 signal_value = features_df[fallback_cols[0]].values
             else:
-                # Absolute fallback: use row index as dummy signal
-                signal_value = list(range(len(features_df)))
+                raise SignalExtractionError(
+                    "linguistic",
+                    f"No signal column found. Tried: {signal_candidates}. "
+                    f"Available columns: {list(features_df.columns)}. "
+                    f"Cannot construct signal without a signal value column.",
+                )
 
         # Pivot: date index, id columns, signal value
         features_df["_date_parsed"] = pd.to_datetime(features_df[date_col], errors="coerce")

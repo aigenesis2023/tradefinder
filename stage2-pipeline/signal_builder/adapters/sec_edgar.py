@@ -47,7 +47,7 @@ SEC_SUBMISSIONS_API = "https://data.sec.gov/submissions"
 # User-Agent required by SEC (rate-limit/block without proper identification).
 # Override with SEC_USER_AGENT env var for production use.
 _SEC_UA = os.environ.get("SEC_USER_AGENT", "")
-SEC_USER_AGENT = _SEC_UA if _SEC_UA else "TradeFinder/1.0.0 (contact via SEC_USER_AGENT env var)"
+SEC_USER_AGENT = _SEC_UA if _SEC_UA else "TradeFinder aigenesis2023@github.com"
 
 # Rate limiting: SEC allows 10 requests/second
 SEC_RATE_LIMIT_DELAY = 0.12
@@ -483,8 +483,8 @@ class SECEdgarAdapter(DataAdapter):
             try:
                 with open(clean_path, "r", encoding="utf-8") as f:
                     return f.read()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to read cached clean text: {e}")
 
         # Cache miss — parse and store
         clean = self._strip_html(raw_text)
@@ -653,8 +653,8 @@ class SECEdgarAdapter(DataAdapter):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     return f.read()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to read cached filing {key}: {e}")
         return None
 
     def _cache_filing(self, key: str, text: str):

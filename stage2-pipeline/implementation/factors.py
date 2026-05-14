@@ -1052,11 +1052,10 @@ class FactorComparisonEngine:
 
         # Alpha decomposition
         factor_explained_alpha = raw_alpha_annualized - exposure.residual_annualized_return
-        factor_explained_pct = (
-            factor_explained_alpha / raw_alpha_annualized * 100
-            if raw_alpha_annualized != 0
-            else 0
-        )
+        if raw_alpha_annualized != 0:
+            factor_explained_pct = max(0.0, min(100.0, factor_explained_alpha / raw_alpha_annualized * 100))
+        else:
+            factor_explained_pct = 0.0
 
         # Verdict
         if exposure.is_factor_recycling:

@@ -232,9 +232,9 @@ class StatisticalBreaker:
             perm_performances[i] = backtest_func(shuffled_signals, forward_returns)
 
         # Two-sided p-value: test whether original performance is extreme
-        # in either direction compared to the null distribution
-        p_value = np.mean(np.abs(perm_performances - np.mean(perm_performances))
-                          >= np.abs(original_perf - np.mean(perm_performances)))
+        # in either direction compared to the null (zero effect).
+        # Under the null, shuffled signals should produce zero-alpha performance.
+        p_value = np.mean(np.abs(perm_performances) >= np.abs(original_perf))
         p_value = max(p_value, 1.0 / (self.n_permutations + 1))
 
         is_significant = p_value < DEFAULT_PERMUTATION_ALPHA

@@ -216,7 +216,7 @@ class UniverseConstructor:
         current_cik = None
         current_start = None
 
-        date_range = pd.date_range(start_date, end_date, freq="D")
+        date_range = pd.date_range(start_date, end_date, freq="B")
 
         for date in date_range:
             date_str = date.strftime("%Y-%m-%d")
@@ -595,7 +595,7 @@ class UniverseConstructor:
             f"from {start_date} to {end_date}"
         )
 
-        date_range = pd.date_range(start_date, end_date, freq="D")
+        date_range = pd.date_range(start_date, end_date, freq="B")
         all_records = []
 
         for date in date_range:

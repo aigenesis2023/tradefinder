@@ -162,7 +162,18 @@ class DownloadPool:
         else:
             logger.info(f"  {desc}: all {n} succeeded")
 
-        return [r for r in results if r is not None]
+        # Ensure we return exactly one result per input item.
+        # If any position is still None (should not happen), create an error result.
+        final_results = []
+        for i, r in enumerate(results):
+            if r is not None:
+                final_results.append(r)
+            else:
+                final_results.append(PoolResult(
+                    item=items[i],
+                    error=RuntimeError(f"Result for item {i} was not set")
+                ))
+        return final_results
 
     def _execute_with_retry(self, func: Callable[[T], R], item: T) -> PoolResult:
         """Execute func with rate limiting and retry on failure."""

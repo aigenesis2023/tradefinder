@@ -376,6 +376,8 @@ class HypothesisPipeline:
         self.universe_df: Optional[pd.DataFrame] = None
         self.signal_df: Optional[pd.DataFrame] = None
         self.price_df: Optional[pd.DataFrame] = None
+        self.volume_df: Optional[pd.DataFrame] = None
+        self.market_cap_df: Optional[pd.DataFrame] = None
         self.backtest_result: Any = None
         self.stat_report: Any = None
         self.adversarial_report: Any = None
@@ -509,6 +511,8 @@ class HypothesisPipeline:
             data_bundle = self._load_market_data()
             self.price_df = data_bundle.get("prices")
             self.signal_df = data_bundle.get("signals")
+            self.volume_df = data_bundle.get("volumes")
+            self.market_cap_df = data_bundle.get("market_caps")
             self._stage_results[stage] = {
                 "n_price_dates": len(self.price_df) if self.price_df is not None else 0,
                 "n_price_tickers": len(self.price_df.columns) if self.price_df is not None else 0,
@@ -984,11 +988,15 @@ class HypothesisPipeline:
             )
 
         price_sources = [ds for ds in hyp.data_sources if ds.source_type == "price"]
+        volumes = None
+        market_caps = None
         if price_sources and price_tickers:
             try:
-                prices = self._load_prices_yahoo(
+                prices, volumes = self._load_prices_yahoo(
                     price_tickers, hyp.time_period.start_date, hyp.time_period.end_date
                 )
+                # Load market caps (point-in-time current, used as constant estimate)
+                market_caps = self._load_market_caps_yahoo(price_tickers)
             except Exception as e:
                 raise PipelineError(
                     f"Yahoo Finance price data load failed for {len(price_tickers)} tickers: {e}. "
@@ -1076,10 +1084,12 @@ class HypothesisPipeline:
             "(not independently constructed)."
         )
 
-    def _load_prices_yahoo(self, tickers: List[str], start: str, end: str) -> pd.DataFrame:
+    def _load_prices_yahoo(self, tickers: List[str], start: str, end: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Load price data from Yahoo Finance (via yfinance or cached CSV).
-        Falls back to simulated data if yfinance is unavailable.
+        Load price and volume data from Yahoo Finance.
+
+        Returns:
+            (price_df, volume_df) — DataFrames with tickers as columns.
         """
         try:
             import yfinance as yf
@@ -1095,9 +1105,9 @@ class HypothesisPipeline:
         if data is None:
             raise PipelineError("Yahoo Finance returned None.")
 
+        volume_df = None
+
         # yfinance returns MultiIndex columns for multi-ticker downloads.
-        # .columns.names gives level names (e.g. ['Price', 'Ticker']), NOT
-        # level values. Use .get_level_values(0) to check for 'Adj Close'.
         if isinstance(data.columns, pd.MultiIndex):
             first_level = data.columns.get_level_values(0)
             if "Adj Close" in first_level:
@@ -1106,33 +1116,76 @@ class HypothesisPipeline:
                 prices = data.xs("Close", axis=1, level=0)
             else:
                 prices = data.xs(first_level[0], axis=1, level=0)
+            if "Volume" in first_level:
+                volume_df = data.xs("Volume", axis=1, level=0)
         else:
-            # Single ticker or different format
             if "Adj Close" in data.columns:
                 prices = data[["Adj Close"]]
             elif "Close" in data.columns:
                 prices = data[["Close"]]
             else:
                 prices = data
+            if "Volume" in data.columns:
+                volume_df = data[["Volume"]]
 
         # Ensure we have a DataFrame with tickers as columns
         if isinstance(prices, pd.Series):
             prices = prices.to_frame()
 
-        # Empty check on DataFrame not on the ndarray underlying it
+        # Empty check
         try:
             is_empty = prices.empty
         except ValueError:
-            # MultiIndex .empty can fail in some pandas versions
             is_empty = (len(prices) == 0)
 
         if is_empty:
             raise PipelineError("Yahoo Finance returned empty data.")
 
         prices.index = pd.to_datetime(prices.index)
-        # Drop tickers with all NaN values
         prices = prices.dropna(axis=1, how="all")
-        return prices
+
+        if volume_df is not None:
+            volume_df.index = pd.to_datetime(volume_df.index)
+            volume_df = volume_df.dropna(axis=1, how="all")
+            # Align volume to same tickers and dates as prices
+            common_cols = prices.columns.intersection(volume_df.columns)
+            common_idx = prices.index.intersection(volume_df.index)
+            volume_df = volume_df.loc[common_idx, common_cols] if len(common_idx) > 0 and len(common_cols) > 0 else None
+
+        return prices, volume_df
+
+    def _load_market_caps_yahoo(self, tickers: List[str]) -> pd.DataFrame:
+        """
+        Load current market capitalizations from Yahoo Finance fast_info.
+
+        Returns a single-row DataFrame (market caps are point-in-time current,
+        not historical — this is a limitation of the free data source).
+        """
+        try:
+            import yfinance as yf
+        except ImportError:
+            return None
+
+        market_caps = {}
+        for t in tickers:
+            try:
+                tkr = yf.Ticker(t)
+                mc = tkr.fast_info.get('market_cap', None)
+                if mc and mc > 0:
+                    market_caps[t] = float(mc)
+                else:
+                    info = tkr.info if hasattr(tkr, 'info') else {}
+                    mc = info.get('marketCap', None)
+                    if mc and mc > 0:
+                        market_caps[t] = float(mc)
+            except Exception:
+                continue
+
+        if not market_caps:
+            return None
+
+        logger.info(f"Loaded market caps for {len(market_caps)}/{len(tickers)} tickers")
+        return pd.DataFrame([market_caps])
 
     def _simulate_price_data(self, tickers: List[str], start: str, end: str) -> pd.DataFrame:
         """
@@ -1291,17 +1344,32 @@ class HypothesisPipeline:
         signal_df = signal_df.loc[common_dates]
         price_df = price_df.loc[common_dates]
 
-        # Create placeholder market cap and volume dataframes (same shape as prices)
-        market_cap_df = pd.DataFrame(
-            np.ones_like(price_df.values, dtype=float) * 1e10,
-            index=price_df.index,
-            columns=price_df.columns,
-        )
-        volume_df = pd.DataFrame(
-            np.ones_like(price_df.values, dtype=float) * 1e8,
-            index=price_df.index,
-            columns=price_df.columns,
-        )
+        # Build volume DataFrame — use real data when available, fall back to price*1e8
+        if self.volume_df is not None and not self.volume_df.empty:
+            common_cols = price_df.columns.intersection(self.volume_df.columns)
+            common_idx = price_df.index.intersection(self.volume_df.index)
+            if len(common_cols) > 0 and len(common_idx) > 0:
+                volume_df = self.volume_df.loc[common_idx, common_cols].reindex(
+                    index=price_df.index, columns=price_df.columns
+                ).fillna(0)
+            else:
+                volume_df = pd.DataFrame(1e8, index=price_df.index, columns=price_df.columns)
+        else:
+            volume_df = pd.DataFrame(1e8, index=price_df.index, columns=price_df.columns)
+
+        # Build market cap DataFrame — use real data when available
+        if self.market_cap_df is not None and not self.market_cap_df.empty:
+            mc_row = self.market_cap_df.iloc[0]
+            mc_data = {}
+            for t in price_df.columns:
+                mc_data[t] = mc_row.get(t, 1e10) if t in mc_row.index else 1e10
+            market_cap_df = pd.DataFrame(
+                [mc_data] * len(price_df),
+                index=price_df.index,
+                columns=price_df.columns,
+            )
+        else:
+            market_cap_df = pd.DataFrame(1e10, index=price_df.index, columns=price_df.columns)
 
         # Run cross-sectional backtest
         result = backtester.run(
@@ -1881,17 +1949,21 @@ class HypothesisPipeline:
 
         # --- SAFEGUARD: Apply contamination verdict capping ---
         if ContaminationDetector is not None and hasattr(ContaminationDetector, 'cap_verdict'):
-            # Check if contamination report is available
             contamination_risk = "CLEAN"  # Default for deterministic extraction
             if hasattr(self, 'hypothesis') and self.hypothesis:
                 signal_spec = self.hypothesis.signal
                 if signal_spec.llm_model_used and signal_spec.llm_model_used != "":
-                    # LLM was used — risk exists
                     contamination_risk = "LOW"
                     all_warnings.append(
                         "LLM used for signal extraction. Contamination risk: LOW. "
                         "Verify that extraction runs are unaffected by training data."
                     )
+            capped = ContaminationDetector.cap_verdict(verdict.value, contamination_risk)
+            if capped != verdict.value:
+                all_warnings.append(f"Verdict capped by ContaminationDetector: contamination_risk={contamination_risk}")
+                verdict = Verdict(capped)
+                if failure_stage is None:
+                    failure_stage = "contamination"
 
         # --- SAFEGUARD: TrialTracker investigation-wide context ---
         investigation_context = None

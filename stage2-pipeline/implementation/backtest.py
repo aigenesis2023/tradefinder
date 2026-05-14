@@ -974,7 +974,7 @@ class CrossSectionalBacktester:
             return 0.0
 
         start_dt = pd.Timestamp(start_date)
-        end_dt = start_dt + pd.Timedelta(days=holding_period_days)
+        end_dt = start_dt + pd.tseries.offsets.BusinessDay(n=holding_period_days)
 
         cohort_return = 0.0
         valid_count = 0

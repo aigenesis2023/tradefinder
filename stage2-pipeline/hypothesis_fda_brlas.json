@@ -1,0 +1,89 @@
+{
+  "name": "FDA Benefit-Risk Linguistic Asymmetry Score (BRLAS)",
+  "uuid": "fda-brlas-001",
+  "source_agent": "Alternative Data Alchemist (Agent 5)",
+  "submission_number": 1,
+  "mechanism": "FDA medical reviewers encode skepticism through asymmetric hedging — hedging benefit claims with cautious language while stating safety concerns with definitive language. The BRLAS composite measures this asymmetry: BRLAS = (HedgeBenefit - HedgeRisk) + (CertaintyRisk - CertaintyBenefit) + 0.5*(ReadabilityBenefit - ReadabilityRisk). A positive BRLAS indicates the reviewer hedges benefits more than risks and is more certain about risks than benefits — the skeptical pattern that predicts Complete Response Letters (CRLs) at elevated rates. Within approved drugs, higher BRLAS identifies drugs where the FDA reviewer had greater safety concerns despite ultimately approving, predicting weaker post-approval market performance.",
+  "llm_advantage": "Deterministic linguistic feature extraction (hedge density, certainty markers, readability scores) at scale across 50-200 page FDA Medical Review documents. The BRLAS composite requires computing cross-sectional linguistic asymmetry across benefit and risk sections — a measurement no existing commercial data product performs. No single analyst reads every FDA Medical Review for all approved drugs.",
+  "why_underweighted": "FDA Medical Reviews are dense regulatory documents (50-200 pages) requiring domain knowledge of clinical trials, adverse event reporting, and FDA review standards. The market reads the binary decision (approved/CRL) but does not systematically parse the linguistic content of the review for asymmetric skepticism signals. Within approved drugs, the market rarely differentiates based on reviewer language intensity.",
+  "universe": {
+    "universe_type": "auto",
+    "custom_tickers": null,
+    "min_price": 5.0,
+    "include_delisted": true
+  },
+  "signal": {
+    "signal_type": "numeric",
+    "signal_name": "brlas",
+    "higher_is_better": false,
+    "llm_model_used": null,
+    "llm_temperature": null,
+    "llm_seed": null,
+    "llm_is_deterministic": true,
+    "signal_source": null
+  },
+  "holding_period_days": 5,
+  "time_period": {
+    "start_date": "2012-01-01",
+    "end_date": "2025-05-01",
+    "oos_start_date": "2023-01-01",
+    "frequency": "as_filed"
+  },
+  "position_sizing": {
+    "method": "equal_weight",
+    "max_position_pct": 0.1,
+    "max_positions": 5,
+    "capital": 100000.0
+  },
+  "minimum_effect_size": {
+    "annualized_alpha_bps": 500,
+    "sharpe_ratio": 0.5,
+    "information_coefficient": 0.05,
+    "hit_rate": 0.55,
+    "max_drawdown_pct": 30.0
+  },
+  "data_sources": [
+    {
+      "source_type": "fda_document",
+      "provider": "fda",
+      "frequency": "as_filed",
+      "fields": [
+        "medical_review",
+        "summary_review",
+        "benefit_section_text",
+        "risk_section_text"
+      ],
+      "start_date": "2012-01-01",
+      "end_date": "2025-05-01",
+      "known_biases": [
+        "Only approved drugs have public Medical Reviews on accessdata.fda.gov — CRL applications lack public review documents, creating survivorship bias toward approved drugs",
+        "Advisory committee briefing documents on www.fda.gov are WAF-blocked (Akamai abuse-detection) — Medical Reviews used as proxy pre-decision documents",
+        "Sponsor-to-ticker mapping is best-effort and may miss biotech companies acquired after approval",
+        "Medical Reviews are written before the FDA decision but published after — temporal ordering is preserved for backtesting but real-time access would require advisory committee briefing documents"
+      ],
+      "api_tier": "free",
+      "monthly_cost_usd": 0.0
+    },
+    {
+      "source_type": "price",
+      "provider": "yahoo",
+      "frequency": "daily",
+      "fields": [
+        "Close",
+        "Volume"
+      ],
+      "start_date": "2012-01-01",
+      "end_date": "2025-05-01",
+      "known_biases": [
+        "Survivorship bias for stocks delisted before ~2017",
+        "Corporate actions may lag 1-2 days",
+        "Foreign-listed tickers (e.g., BBS.F, HIK.L) may not have Yahoo Finance data"
+      ],
+      "api_tier": "free",
+      "monthly_cost_usd": 0.0
+    }
+  ],
+  "falsifiable_prediction": "Drugs in the top tercile of BRLAS (most skeptical reviewer language) should underperform bottom-tercile drugs by at least 500bps over the 5 trading days following the FDA decision date, and should have a higher rate of post-approval safety events (REMS requirements, label changes, post-marketing requirements).",
+  "self_assessed_confidence": "MEDIUM",
+  "biggest_weakness": "CRL applications have no public Medical Reviews on accessdata.fda.gov — the sample is entirely approved drugs, limiting the test to within-approved variation in BRLAS rather than the full CRL-vs-Approval prediction. Also, advisory committee briefing documents on www.fda.gov are WAF-blocked, so real-time trading would require access to pre-decision documents that are currently unavailable."
+}

@@ -580,6 +580,20 @@ class SignalBuilder:
             params["date_column"] = self._find_date_column(raw_data.records)
             params["id_column"] = self._find_id_column(raw_data.records)
 
+        # If using ticker as ID, filter out rows with empty tickers
+        # (drugs whose sponsors couldn't be mapped to a stock ticker)
+        if params.get("id_column") == "ticker":
+            n_before = len(raw_data.records)
+            raw_data.records = raw_data.records[
+                raw_data.records["ticker"].fillna("").str.strip() != ""
+            ].copy()
+            n_after = len(raw_data.records)
+            if n_after < n_before:
+                logger.info(
+                    f"  Filtered to {n_after}/{n_before} entries with "
+                    f"valid ticker mappings"
+                )
+
         if params.get("composite") == "brlas":
             params["signal_column"] = "composite_score"
 
@@ -618,8 +632,17 @@ class SignalBuilder:
         return ""
 
     def _find_id_column(self, df: "pd.DataFrame") -> str:
-        """Find an identifier column in the DataFrame."""
-        for col in ["drug_name", "application_number", "ticker", "cik", "sponsor"]:
+        """Find an identifier column in the DataFrame.
+
+        Priority order: ticker (for price data integration), then drug_name
+        (for text-only analysis), then application_number, cik, sponsor.
+        """
+        # Prefer ticker — required for Yahoo Finance price data in pipeline
+        if "ticker" in df.columns:
+            n_nonempty = int((df["ticker"].fillna("").str.strip() != "").sum())
+            if n_nonempty > 0:
+                return "ticker"
+        for col in ["drug_name", "application_number", "cik", "sponsor"]:
             if col in df.columns:
                 return col
         return ""

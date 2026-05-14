@@ -808,6 +808,382 @@ class WalkForwardBacktester:
 
 
 # ============================================================================
+# Event-Study Backtester
+# ============================================================================
+
+
+class EventStudyBacktester:
+    """
+    Implements event-study backtesting for sparse event-driven signals.
+
+    Designed for hypotheses where each stock has exactly one signal value
+    on a single event date (e.g., FDA drug approval date, earnings surprise
+    announcement date). The signal DataFrame is a sparse date x ticker matrix
+    where only event dates have non-NaN values for the affected tickers.
+
+    Methodology:
+    1. Extract all (date, ticker, signal_value) tuples from sparse signal matrix.
+    2. For each event, compute the forward holding-period return from the
+       event date using the price data.
+    3. Optionally compute market-adjusted excess returns (equal-weight average
+       of all available tickers over the same window).
+    4. Return a BacktestResult where the returns series holds the individual
+       event returns indexed by event date. This enables the downstream
+       statistical tests to assess whether signal values predict returns.
+    """
+
+    def __init__(
+        self,
+        cost_calculator: Optional[TransactionCostCalculator] = None,
+        position_sizer_spec: Optional[PositionSizingSpec] = None,
+    ):
+        self.cost_calculator = cost_calculator or TransactionCostCalculator()
+        self.position_sizer = PositionSizer(position_sizer_spec or PositionSizingSpec())
+
+    def run(
+        self,
+        signal_df: pd.DataFrame,
+        price_df: pd.DataFrame,
+        market_cap_df: pd.DataFrame,
+        volume_df: pd.DataFrame,
+        sector_df: Optional[pd.DataFrame] = None,
+        holding_period_days: int = 21,
+        excess_returns: bool = True,
+        min_events: int = 5,
+    ) -> BacktestResult:
+        """
+        Run event-study backtest.
+
+        Args:
+            signal_df: Sparse date x ticker matrix of signals (mostly NaN).
+            price_df: date x ticker matrix of prices.
+            market_cap_df: date x ticker matrix of market caps.
+            volume_df: date x ticker matrix of dollar volumes.
+            sector_df: Optional date x ticker matrix of sector classifications.
+            holding_period_days: Forward holding period for each event.
+            excess_returns: If True, compute market-adjusted excess returns.
+            min_events: Minimum number of events required.
+
+        Returns:
+            BacktestResult with individual event returns.
+        """
+        # Extract all (date, ticker, signal_value) events
+        events = self._extract_events(signal_df)
+        if len(events) < min_events:
+            logger.warning(
+                f"Only {len(events)} events found (need {min_events}). "
+                "Insufficient for event study."
+            )
+            return self._empty_result()
+
+        logger.info(
+            f"EventStudyBacktester: {len(events)} events across "
+            f"{events['date'].nunique()} dates, {events['ticker'].nunique()} tickers"
+        )
+
+        # Compute forward returns for each event
+        event_returns = []
+        trades = []
+
+        for _, event in events.iterrows():
+            event_date = event["date"]
+            ticker = event["ticker"]
+            signal_value = event["signal"]
+
+            if ticker not in price_df.columns:
+                continue
+
+            ret = self._compute_event_return(
+                ticker=ticker,
+                event_date=event_date,
+                price_df=price_df,
+                holding_period_days=holding_period_days,
+            )
+
+            if ret is None:
+                continue
+
+            # Compute market return for excess return if requested
+            market_ret = 0.0
+            if excess_returns:
+                market_ret = self._compute_market_return(
+                    price_df=price_df,
+                    event_date=event_date,
+                    holding_period_days=holding_period_days,
+                    exclude_ticker=ticker,
+                )
+
+            excess_ret = ret - market_ret
+
+            # Estimate trade cost for a hypothetical position
+            try:
+                entry_date = event["entry_date"]
+                entry_price = event["entry_price"]
+            except KeyError:
+                entry_price = 50.0
+
+            cost = self.cost_calculator.calculate_trade_cost(
+                ticker=ticker,
+                side=Side.LONG,
+                shares=int(self.position_sizer.spec.capital / entry_price) if entry_price > 0 else 100,
+                price=entry_price,
+                market_cap=event.get("market_cap", 1e10),
+                adv=event.get("adv", 1e7),
+                holding_period_days=holding_period_days,
+            )
+
+            event_returns.append({
+                "date": event_date,
+                "ticker": ticker,
+                "signal": signal_value,
+                "gross_return": ret,
+                "market_return": market_ret,
+                "excess_return": excess_ret,
+                "entry_price": entry_price,
+                "cost_bps": cost.cost_bps,
+                "total_cost": cost.total_cost,
+            })
+
+            trades.append({
+                "date": event_date,
+                "ticker": ticker,
+                "side": "LONG",
+                "shares": int(self.position_sizer.spec.capital / entry_price) if entry_price > 0 else 100,
+                "price": entry_price,
+                "notional": self.position_sizer.spec.capital,
+                "weight": 1.0,
+                "total_cost": cost.total_cost,
+                "cost_bps": cost.cost_bps,
+            })
+
+        if not event_returns:
+            logger.warning("No valid event returns computed.")
+            return self._empty_result()
+
+        returns_df = pd.DataFrame(event_returns)
+        returns_df["date"] = pd.to_datetime(returns_df["date"])
+        returns_df = returns_df.set_index("date")
+
+        # Use excess returns as the primary return series
+        return_series = returns_df["excess_return"].copy()
+        gross_series = returns_df["gross_return"].copy()
+
+        trades_df = pd.DataFrame(trades)
+        if not trades_df.empty:
+            trades_df["date"] = pd.to_datetime(trades_df["date"])
+
+        return self._compile_result(
+            trades_df=trades_df,
+            returns_series=return_series,
+            gross_series=gross_series,
+            events_df=returns_df,
+            holding_period_days=holding_period_days,
+        )
+
+    def _extract_events(self, signal_df: pd.DataFrame) -> pd.DataFrame:
+        """Extract all (date, ticker, signal_value) events from sparse signal matrix."""
+        events = []
+        for date in signal_df.index:
+            day_signals = signal_df.loc[date].dropna()
+            for ticker in day_signals.index:
+                events.append({
+                    "date": pd.Timestamp(date),
+                    "ticker": ticker,
+                    "signal": float(day_signals[ticker]),
+                })
+        return pd.DataFrame(events)
+
+    def _compute_event_return(
+        self,
+        ticker: str,
+        event_date: pd.Timestamp,
+        price_df: pd.DataFrame,
+        holding_period_days: int,
+    ) -> Optional[float]:
+        """Compute the forward holding-period return for a single event.
+
+        Entry price: first available price strictly after event_date.
+        Exit price: last available price on or before event_date + holding_period_days.
+        """
+        ticker_prices = price_df[ticker].dropna()
+        if ticker_prices.empty:
+            return None
+
+        entry_prices = ticker_prices[ticker_prices.index > event_date]
+        if entry_prices.empty:
+            return None
+
+        entry_idx = entry_prices.index[0]
+        entry_price = entry_prices.iloc[0]
+
+        end_dt = event_date + pd.tseries.offsets.BusinessDay(n=holding_period_days)
+        exit_prices = ticker_prices[(ticker_prices.index > entry_idx) & (ticker_prices.index <= end_dt)]
+        if exit_prices.empty:
+            return None
+
+        exit_price = exit_prices.iloc[-1]
+
+        if entry_price <= 0:
+            return None
+
+        return float((exit_price / entry_price) - 1.0)
+
+    def _compute_market_return(
+        self,
+        price_df: pd.DataFrame,
+        event_date: pd.Timestamp,
+        holding_period_days: int,
+        exclude_ticker: Optional[str] = None,
+    ) -> float:
+        """Compute equal-weight market return over the holding period.
+
+        Uses all tickers with valid prices over the window, excluding the
+        event ticker to avoid contamination.
+        """
+        ticker_returns = []
+        for ticker in price_df.columns:
+            if ticker == exclude_ticker:
+                continue
+
+            ticker_prices = price_df[ticker].dropna()
+            if ticker_prices.empty:
+                continue
+
+            entry_prices = ticker_prices[ticker_prices.index > event_date]
+            if entry_prices.empty:
+                continue
+
+            entry_idx = entry_prices.index[0]
+            entry_price = entry_prices.iloc[0]
+
+            end_dt = event_date + pd.tseries.offsets.BusinessDay(n=holding_period_days)
+            exit_prices = ticker_prices[(ticker_prices.index > entry_idx) & (ticker_prices.index <= end_dt)]
+            if exit_prices.empty:
+                continue
+
+            exit_price = exit_prices.iloc[-1]
+            if entry_price > 0:
+                ticker_returns.append(float((exit_price / entry_price) - 1.0))
+
+        if not ticker_returns:
+            return 0.0
+
+        return float(np.mean(ticker_returns))
+
+    def _empty_result(self) -> BacktestResult:
+        """Return an empty BacktestResult."""
+        return BacktestResult(
+            gross_returns=pd.Series(dtype=float),
+            net_returns=pd.Series(dtype=float),
+            cost_breakdown=pd.DataFrame(),
+            positions=pd.DataFrame(),
+            trade_log=pd.DataFrame(),
+            gross_total_return=0.0,
+            gross_annualized_return=0.0,
+            gross_annualized_volatility=0.0,
+            gross_sharpe_ratio=0.0,
+            gross_max_drawdown=0.0,
+            net_total_return=0.0,
+            net_annualized_return=0.0,
+            net_annualized_volatility=0.0,
+            net_sharpe_ratio=0.0,
+            net_max_drawdown=0.0,
+            total_costs_bps=0.0,
+            average_cost_per_trade_bps=0.0,
+            annual_turnover=0.0,
+            cost_drag_annualized_bps=0.0,
+            start_date="",
+            end_date="",
+            n_trades=0,
+            n_trading_days=0,
+            warnings=["Insufficient events for event study backtest."],
+        )
+
+    def _compile_result(
+        self,
+        trades_df: pd.DataFrame,
+        returns_series: pd.Series,
+        gross_series: pd.Series,
+        events_df: pd.DataFrame,
+        holding_period_days: int = 21,
+    ) -> BacktestResult:
+        """Compile event-study backtest result.
+
+        For event studies, the "returns" are individual event excess returns.
+        Annualization uses the actual calendar span between the first and last
+        event, scaled by the holding period.
+        """
+        n_events = len(returns_series)
+
+        if n_events < 2:
+            n_years = holding_period_days / 252.0
+        else:
+            calendar_days = (returns_series.index[-1] - returns_series.index[0]).days
+            n_years = max(calendar_days / 365.25, holding_period_days / 252.0)
+
+        periods_per_year = max(252.0 / holding_period_days, 1.0)
+        ann_vol_factor = np.sqrt(periods_per_year)
+
+        if returns_series.empty:
+            gross_total_return = 0.0
+            gross_ann_return = 0.0
+            gross_ann_vol = 0.0
+            gross_sharpe = 0.0
+            gross_max_dd = 0.0
+        else:
+            gross_total_return = (1 + returns_series).prod() - 1
+            gross_ann_return = (1 + gross_total_return) ** (1 / n_years) - 1 if n_years > 0 else 0.0
+            gross_ann_vol = returns_series.std() * ann_vol_factor
+            gross_sharpe = gross_ann_return / gross_ann_vol if gross_ann_vol > 0 else 0.0
+            cum_returns = (1 + returns_series).cumprod()
+            gross_max_dd = (cum_returns / cum_returns.cummax() - 1).min()
+
+        total_costs = trades_df["total_cost"].sum() if not trades_df.empty else 0.0
+        capital = self.position_sizer.spec.capital
+        cost_drag_annual_bps = (
+            total_costs / (capital * n_years) * 10000
+            if n_years > 0 and capital > 0
+            else 0.0
+        )
+
+        net_total_return = gross_total_return - (
+            total_costs / capital if capital > 0 else 0.0
+        )
+        net_ann_return = (1 + net_total_return) ** (1 / n_years) - 1 if n_years > 0 else 0.0
+        net_sharpe = net_ann_return / gross_ann_vol if gross_ann_vol > 0 else 0.0
+
+        start_date = str(returns_series.index[0]) if not returns_series.empty else ""
+        end_date = str(returns_series.index[-1]) if not returns_series.empty else ""
+
+        return BacktestResult(
+            gross_returns=gross_series if not gross_series.empty else returns_series,
+            net_returns=returns_series,
+            cost_breakdown=trades_df.groupby("date")["total_cost"].sum() if not trades_df.empty else pd.DataFrame(),
+            positions=pd.DataFrame(),
+            trade_log=trades_df,
+            gross_total_return=gross_total_return,
+            gross_annualized_return=gross_ann_return,
+            gross_annualized_volatility=gross_ann_vol,
+            gross_sharpe_ratio=gross_sharpe,
+            gross_max_drawdown=gross_max_dd,
+            net_total_return=net_total_return,
+            net_annualized_return=net_ann_return,
+            net_annualized_volatility=gross_ann_vol,
+            net_sharpe_ratio=net_sharpe,
+            net_max_drawdown=gross_max_dd,
+            total_costs_bps=total_costs / capital * 10000 if capital > 0 else 0.0,
+            average_cost_per_trade_bps=trades_df["cost_bps"].mean() if not trades_df.empty else 0.0,
+            annual_turnover=0.0,
+            cost_drag_annualized_bps=cost_drag_annual_bps,
+            start_date=start_date,
+            end_date=end_date,
+            n_trades=len(trades_df),
+            n_trading_days=n_events,
+            warnings=[],
+        )
+
+
+# ============================================================================
 # Cross-Sectional Backtester
 # ============================================================================
 

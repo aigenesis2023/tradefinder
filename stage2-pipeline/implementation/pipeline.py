@@ -60,6 +60,7 @@ from temporal import (
 )
 from backtest import (
     CrossSectionalBacktester,
+    EventStudyBacktester,
     TransactionCostCalculator,
     TransactionCostModel,
     PositionSizer,
@@ -1108,16 +1109,31 @@ class HypothesisPipeline:
         volume_df = None
 
         # yfinance returns MultiIndex columns for multi-ticker downloads.
+        # When some tickers fail (delisted, invalid), 'Adj Close' may exist
+        # only for the failed tickers while valid ones use 'Close'.
+        # Build price DataFrame manually from the MultiIndex to handle this.
         if isinstance(data.columns, pd.MultiIndex):
+            prices = pd.DataFrame(index=data.index)
+            for t in tickers:
+                if ('Adj Close', t) in data.columns:
+                    series = data[('Adj Close', t)]
+                elif ('Close', t) in data.columns:
+                    series = data[('Close', t)]
+                else:
+                    continue
+                if not series.dropna().empty:
+                    prices[t] = series
+
             first_level = data.columns.get_level_values(0)
-            if "Adj Close" in first_level:
-                prices = data.xs("Adj Close", axis=1, level=0)
-            elif "Close" in first_level:
-                prices = data.xs("Close", axis=1, level=0)
-            else:
-                prices = data.xs(first_level[0], axis=1, level=0)
-            if "Volume" in first_level:
-                volume_df = data.xs("Volume", axis=1, level=0)
+            if 'Volume' in first_level:
+                volume_df = pd.DataFrame(index=data.index)
+                for t in tickers:
+                    if ('Volume', t) in data.columns:
+                        series = data[('Volume', t)]
+                        if not series.dropna().empty:
+                            volume_df[t] = series
+                if volume_df.empty:
+                    volume_df = None
         else:
             if "Adj Close" in data.columns:
                 prices = data[["Adj Close"]]
@@ -1128,18 +1144,12 @@ class HypothesisPipeline:
             if "Volume" in data.columns:
                 volume_df = data[["Volume"]]
 
-        # Ensure we have a DataFrame with tickers as columns
+        # Ensure we have a DataFrame
         if isinstance(prices, pd.Series):
             prices = prices.to_frame()
 
-        # Empty check
-        try:
-            is_empty = prices.empty
-        except ValueError:
-            is_empty = (len(prices) == 0)
-
-        if is_empty:
-            raise PipelineError("Yahoo Finance returned empty data.")
+        if prices.empty or prices.columns.empty:
+            raise PipelineError("Yahoo Finance returned no valid price data for any ticker.")
 
         prices.index = pd.to_datetime(prices.index)
         prices = prices.dropna(axis=1, how="all")
@@ -1147,11 +1157,12 @@ class HypothesisPipeline:
         if volume_df is not None:
             volume_df.index = pd.to_datetime(volume_df.index)
             volume_df = volume_df.dropna(axis=1, how="all")
-            # Align volume to same tickers and dates as prices
             common_cols = prices.columns.intersection(volume_df.columns)
             common_idx = prices.index.intersection(volume_df.index)
             volume_df = volume_df.loc[common_idx, common_cols] if len(common_idx) > 0 and len(common_cols) > 0 else None
 
+        valid_count = len(prices.columns)
+        logger.info(f"Loaded prices for {valid_count}/{len(tickers)} tickers")
         return prices, volume_df
 
     def _load_market_caps_yahoo(self, tickers: List[str]) -> pd.DataFrame:
@@ -1295,7 +1306,11 @@ class HypothesisPipeline:
         }
 
     def _run_backtest(self):
-        """Stage 5: Run the cross-sectional backtest with transaction costs."""
+        """Stage 5: Run the cross-sectional backtest with transaction costs.
+
+        Detects whether the signal matrix is sparse (event-study) or dense
+        (continuous cross-sectional) and routes to the appropriate backtester.
+        """
         hyp = self.hypothesis
 
         # Build cost model
@@ -1320,10 +1335,6 @@ class HypothesisPipeline:
         )
 
         cost_calc = TransactionCostCalculator(model=cost_model)
-        backtester = CrossSectionalBacktester(
-            cost_calculator=cost_calc,
-            position_sizer_spec=sizing_spec,
-        )
 
         # Prepare data
         signal_df = self.signal_df if self.signal_df is not None and not self.signal_df.empty else self._make_fallback_signals()
@@ -1335,14 +1346,11 @@ class HypothesisPipeline:
 
         # Align dates between signals and prices
         common_dates = signal_df.index.intersection(price_df.index)
-        if len(common_dates) < 10:
+        if len(common_dates) < 3:
             raise PipelineError(
                 f"Insufficient overlapping dates between signals and prices "
-                f"({len(common_dates)} dates). Need at least 10."
+                f"({len(common_dates)} dates). Need at least 3."
             )
-
-        signal_df = signal_df.loc[common_dates]
-        price_df = price_df.loc[common_dates]
 
         # Build volume DataFrame — use real data when available, fall back to price*1e8
         if self.volume_df is not None and not self.volume_df.empty:
@@ -1371,17 +1379,87 @@ class HypothesisPipeline:
         else:
             market_cap_df = pd.DataFrame(1e10, index=price_df.index, columns=price_df.columns)
 
-        # Run cross-sectional backtest
-        result = backtester.run(
-            signal_df=signal_df,
-            price_df=price_df,
-            market_cap_df=market_cap_df,
-            volume_df=volume_df,
-            holding_period_days=hyp.holding_period_days,
-            rebalance_frequency=hyp.position_sizing.rebalance_frequency,
-        )
+        # --- Detect sparse event-study vs. dense cross-sectional signal ---
+        is_event_study = self._is_event_study_signal(signal_df)
+
+        if is_event_study:
+            logger.info(
+                f"Detected event-study signal (sparse: "
+                f"{signal_df.notna().sum().sum()} non-NaN across "
+                f"{signal_df.shape[0]} dates x {signal_df.shape[1]} tickers). "
+                f"Using EventStudyBacktester."
+            )
+            # EventStudyBacktester needs the FULL price_df (not aligned to
+            # signal dates) to compute forward holding-period returns.
+            # Only the signal dates are aligned to common dates.
+            signal_df_aligned = signal_df.loc[common_dates]
+
+            backtester = EventStudyBacktester(
+                cost_calculator=cost_calc,
+                position_sizer_spec=sizing_spec,
+            )
+            result = backtester.run(
+                signal_df=signal_df_aligned,
+                price_df=price_df,
+                market_cap_df=market_cap_df,
+                volume_df=volume_df,
+                holding_period_days=hyp.holding_period_days,
+                excess_returns=True,
+                min_events=5,
+            )
+        else:
+            signal_df = signal_df.loc[common_dates]
+            price_df = price_df.loc[common_dates]
+
+            backtester = CrossSectionalBacktester(
+                cost_calculator=cost_calc,
+                position_sizer_spec=sizing_spec,
+            )
+            result = backtester.run(
+                signal_df=signal_df,
+                price_df=price_df,
+                market_cap_df=market_cap_df,
+                volume_df=volume_df,
+                holding_period_days=hyp.holding_period_days,
+                rebalance_frequency=hyp.position_sizing.rebalance_frequency,
+            )
 
         return result
+
+    @staticmethod
+    def _is_event_study_signal(signal_df: pd.DataFrame) -> bool:
+        """Detect whether a signal DataFrame represents an event study.
+
+        An event-study signal is one where:
+        - Fewer than 10% of cells are non-NaN (very sparse)
+        - Median non-NaN values per column (ticker) is 1 (one event per stock)
+        - OR fewer than 3 unique tickers have >3 non-NaN values
+
+        This distinguishes FDA decision dates, M&A announcements, etc.
+        from continuous cross-sectional signals like factor tilts.
+        """
+        n_cells = signal_df.shape[0] * signal_df.shape[1]
+        if n_cells == 0:
+            return False
+        n_non_nan = int(signal_df.notna().sum().sum())
+        sparsity = n_non_nan / n_cells
+
+        if sparsity == 0:
+            return False
+
+        if sparsity < 0.10:
+            # Check per-ticker signal count
+            per_ticker = signal_df.notna().sum(axis=0)
+            median_events = per_ticker.median()
+            if median_events <= 1.5:
+                return True
+
+            # Few tickers with many signals
+            n_multi_event = int((per_ticker > 3).sum())
+            if n_multi_event <= 3:
+                return True
+
+        return False
 
     def _make_fallback_signals(self) -> pd.DataFrame:
         """Create a fallback signal DataFrame when none is provided.

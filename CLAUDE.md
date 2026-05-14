@@ -12,9 +12,29 @@ Information firewall: Stage 1 and Stage 2 never communicate. Pipeline is locked 
 
 ## Current State
 
-**Audit complete (2026-05-14):** 55 issues fixed across 15 files. All silent data fabrication eliminated — pipeline now honestly reports UNTESTABLE when data is unavailable. DownloadPool with token-bucket rate limiting enables parallel SEC/Yahoo data acquisition. Calendar-based annualization with business-day temporal alignment produces realistic metrics. Factor regression uses Newey-West HAC standard errors. Permutation tests are two-sided.
+**Audit complete (2026-05-14):** 55 issues fixed across 15 files. All silent data fabrication eliminated. DownloadPool, Newey-West HAC SE, calendar annualization, business-day temporal alignment all in place.
 
-**Verified end-to-end run:** MD&A Tone Shift → BROKEN (Sharpe 0.82, bootstrap CI includes zero, permutation p=1.0, power 23.7%).
+**Engine status — 4 hypotheses tested, all BROKEN:**
+1. MD&A Tone Shift → BROKEN (Sharpe 0.82, CI includes zero)
+2. Risk Factor Drift → BROKEN (CI includes zero, p=1.0)
+3. FDA BRLAS → BROKEN (α=339bps < 500bps min, 20 events)
+4. CAM Expansion Velocity → BROKEN (hit rate 51.85% < 55% min)
+
+**Infrastructure built (2026-05-14 session):**
+- EventStudyBacktester: handles sparse/event-driven signals (FDA, M&A, regulatory)
+- Sparse signal auto-detection: routes to event study vs cross-sectional backtest
+- LLMExtractor: generic LLM-based signal extraction (Anthropic/DeepSeek API, temp=0)
+- 8-K section extraction: Item 5.02 (departure), Item 2.02 (earnings), etc.
+- SEC User-Agent fix: honest `TradeFinderResearch/1.0` — browser-mimetic strings rejected
+- Universe refresh: 10,347 SEC tickers available (was stuck at 61 due to WAF)
+
+**13 of 16 Stage 1 hypotheses still untested. Signal construction is the bottleneck.**
+
+**Next session:**
+- Departure Language Severity run was mid-LLM-extraction when interrupted — restart needed
+- Pronoun Divergence needs transcript data source (not on SEC EDGAR)
+- Consider pre-building filing cache for faster iteration
+- Fix LLM response parsing (DeepSeek returns thinking block before text)
 
 ## Data Adapters
 

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # SEC company_tickers.json endpoint — maps CIK to ticker for all filers
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_USER_AGENT = "TradeFinder aigenesis2023@github.com"
+SEC_USER_AGENT = "TradeFinderResearch/1.0 (research@tradefinder.dev)"
 SEC_RATE_LIMIT_DELAY = 0.12
 
 # Default universe constraints

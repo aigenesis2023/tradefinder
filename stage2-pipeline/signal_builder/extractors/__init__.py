@@ -11,9 +11,11 @@ if _PARENT not in _sys.path:
     _sys.path.insert(0, _PARENT)
 
 from .linguistic import LinguisticExtractor
+from .llm_extractor import LLMExtractor
 
 EXTRACTOR_REGISTRY: dict = {
     "linguistic": LinguisticExtractor,
+    "llm": LLMExtractor,
 }
 
 
@@ -30,6 +32,7 @@ def get_extractor(name: str):
 
 __all__ = [
     "LinguisticExtractor",
+    "LLMExtractor",
     "EXTRACTOR_REGISTRY",
     "get_extractor",
 ]

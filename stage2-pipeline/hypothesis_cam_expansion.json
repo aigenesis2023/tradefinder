@@ -1,0 +1,86 @@
+{
+  "name": "CAM Expansion Velocity as Distress Precursor",
+  "uuid": "cam-expansion-001",
+  "source_agent": "Filing Archaeologist (Agent 2)",
+  "submission_number": 1,
+  "mechanism": "When auditors add Critical Audit Matters in new topic clusters not previously associated with a company, it signals escalating accounting complexity that precedes visible financial deterioration by 1-3 quarters. LLM advantage: systematic CAM topic clustering across the entire market — embedding CAM paragraphs, building a market-wide taxonomy, and detecting when a company's CAM set expands into new clusters.",
+  "llm_advantage": "CAMs are mandatory PCAOB AS 3101 disclosures that no existing commercial data product systematically parses. The LLM embeds CAM paragraphs across all public companies, builds a market-wide CAM topic taxonomy via clustering, and detects CAM expansion into new topic clusters — a cross-sectional anomaly detection no existing system performs.",
+  "why_underweighted": "CAMs are new (mandatory since mid-2019), the academic literature is thin (focused on audit fees not stock returns), and the market views the auditor's report as a binary pass/fail signal rather than a continuous multi-dimensional signal source. The structural lag (auditors identify problems before they appear in financials) means the information is not immediately priced.",
+  "universe": {
+    "universe_type": "auto",
+    "custom_tickers": null,
+    "min_price": 5.0,
+    "include_delisted": true
+  },
+  "signal": {
+    "signal_type": "numeric",
+    "signal_name": "cam_expansion_velocity",
+    "higher_is_better": false,
+    "llm_model_used": null,
+    "llm_temperature": null,
+    "llm_seed": null,
+    "llm_is_deterministic": true,
+    "signal_source": null
+  },
+  "holding_period_days": 126,
+  "time_period": {
+    "start_date": "2020-01-01",
+    "end_date": "2025-05-01",
+    "oos_start_date": "2023-06-01",
+    "frequency": "quarterly"
+  },
+  "position_sizing": {
+    "method": "equal_weight",
+    "max_position_pct": 0.1,
+    "max_positions": 10,
+    "capital": 100000.0
+  },
+  "minimum_effect_size": {
+    "annualized_alpha_bps": 500,
+    "sharpe_ratio": 0.5,
+    "information_coefficient": 0.05,
+    "hit_rate": 0.55,
+    "max_drawdown_pct": 30.0
+  },
+  "data_sources": [
+    {
+      "source_type": "sec_filing",
+      "provider": "sec_edgar",
+      "frequency": "quarterly",
+      "fields": [
+        "10-K",
+        "10-Q"
+      ],
+      "start_date": "2020-01-01",
+      "end_date": "2025-05-01",
+      "known_biases": [
+        "CAMs only mandatory since mid-2019 — limited historical data for long-horizon backtests",
+        "CAM language varies by audit firm (Deloitte vs PwC vs EY vs KPMG) requiring robust cross-firm embeddings",
+        "Most companies have stable CAM sets year-over-year — signal fires infrequently",
+        "Structural reporting lag: CAMs filed 45-90 days after fiscal year-end means 1-2 earnings releases have already occurred"
+      ],
+      "api_tier": "free",
+      "monthly_cost_usd": 0.0
+    },
+    {
+      "source_type": "price",
+      "provider": "yahoo",
+      "frequency": "daily",
+      "fields": [
+        "Close",
+        "Volume"
+      ],
+      "start_date": "2020-01-01",
+      "end_date": "2025-05-01",
+      "known_biases": [
+        "Survivorship bias for stocks delisted before ~2017",
+        "Corporate actions may lag 1-2 days"
+      ],
+      "api_tier": "free",
+      "monthly_cost_usd": 0.0
+    }
+  ],
+  "falsifiable_prediction": "Companies with CAM expansion into new topic clusters should underperform companies with stable CAM sets by at least 500bps annualized over the subsequent 6 months. The effect should persist even when recent earnings have been stable/growing, confirming auditors identify latent problems not yet visible in reported financials.",
+  "self_assessed_confidence": "HIGH",
+  "biggest_weakness": "Auditor timeliness: even with the stable-earnings test, the structural lag means CAM expansion must provide incremental information beyond what the market can already observe from quarterly earnings releases. Also, 5-6 years of data is limited for a 6-month holding period."
+}

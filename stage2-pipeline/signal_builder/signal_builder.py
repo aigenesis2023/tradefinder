@@ -263,6 +263,7 @@ class SignalBuilder:
         # Step 5: Extract signal
         signal_data = self._extract_signal(
             extractor=extractor,
+            extractor_name=extractor_name,
             raw_data_map=all_raw_data,
             hypothesis=hypothesis,
             force_synthetic=force_synthetic,
@@ -504,24 +505,38 @@ class SignalBuilder:
     def _determine_extractor(self, hypothesis: HypothesisSpec) -> str:
         """Determine which extractor to use based on the hypothesis's data sources.
 
-        Currently always returns 'linguistic' since it's the primary extractor.
-        Future: could route to 'filing_diff' or 'classification' based on
-        source_type or signal_name.
+        Routes to LLM extractor when:
+        - The hypothesis requires semantic understanding beyond generic features
+        - The signal name matches known hypothesis-specific patterns
+        - LLM model is explicitly configured
+
+        Falls back to LinguisticExtractor for generic feature extraction.
         """
+        signal_name = (hypothesis.signal.signal_name or "").lower()
+        hypothesis_name = (hypothesis.name or "").lower()
+
+        # Hypothesis-specific signals that need LLM semantic understanding
+        llm_signal_patterns = [
+            "departure", "severity", "pronoun", "credibility",
+            "echo", "coherence", "fragility", "scripted",
+            "semantic", "pivot", "sentiment_trajectory",
+            "cam_expansion", "cam_velocity",
+        ]
+        for pattern in llm_signal_patterns:
+            if pattern in signal_name or pattern in hypothesis_name:
+                return "llm"
+
+        # Explicit LLM configuration
+        if hypothesis.signal.llm_model_used:
+            return "llm"
+
+        # Data-source-based routing
         for ds in hypothesis.data_sources:
             source_type = ds.source_type.lower()
-            if "fda" in source_type or "document" in source_type:
-                return "linguistic"
-            if "sec_filing" in source_type or "filing" in source_type:
-                return "linguistic"
             if "transcript" in source_type:
-                return "linguistic"
+                return "llm"  # Transcripts need LLM for speaker-aware context
 
-        # Default for text-based signals
-        signal_type = hypothesis.signal.signal_type
-        if signal_type in ("numeric", "composite"):
-            return "linguistic"
-
+        # Default: deterministic linguistic extraction
         return "linguistic"
 
     def _extract_signal(
@@ -530,6 +545,7 @@ class SignalBuilder:
         raw_data_map: Dict[str, RawData],
         hypothesis: HypothesisSpec,
         force_synthetic: bool = False,
+        extractor_name: str = "linguistic",
     ) -> SignalData:
         """Extract the signal from raw data using the chosen extractor.
 
@@ -569,9 +585,11 @@ class SignalBuilder:
                 params["text_columns"] = {}
 
         # Add LLM config if using LLM extraction
-        if hypothesis.signal.llm_model_used:
+        if extractor_name == "llm":
             params["use_llm"] = True
-            params["llm_model"] = hypothesis.signal.llm_model_used
+            params["hypothesis"] = hypothesis
+            params["raw_data_map"] = raw_data_map
+            params["llm_model"] = hypothesis.signal.llm_model_used or None
             params["llm_temperature"] = hypothesis.signal.llm_temperature or 0.0
             params["llm_seed"] = hypothesis.signal.llm_seed or 42
 

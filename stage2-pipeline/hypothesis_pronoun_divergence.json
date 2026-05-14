@@ -1,0 +1,87 @@
+{
+  "name": "Pronoun Divergence Signal",
+  "uuid": "pronoun-divergence-001",
+  "source_agent": "Earnings Whisperer (Agent 1)",
+  "submission_number": 1,
+  "mechanism": "Executives unconsciously shift from first-person plural ('we', 'us', 'our') to depersonalized constructions during Q&A when they possess undisclosed negative information or face material uncertainty. The Pronoun Participation Ratio (PPR = count of 'we' + 'us' + 'our' / count of all pronouns) drops below the executive's personal 10th percentile baseline, predicting negative excess returns of 200bps over 1-5 days. The signal is asymmetric: pronoun drops predict negative returns but pronoun spikes do NOT predict positive returns.",
+  "llm_advantage": "Systematic per-executive pronoun baseline computation across 4,000+ earnings calls per quarter. The LLM tracks per-executive, per-topic pronoun ratio distributions against 8+ quarters of historical baselines — a measurement task no human analyst can perform at scale. Topic-level segmentation prevents topic drift from being misclassified as psychological distancing.",
+  "why_underweighted": "Behavioral signals embedded in unconscious speech patterns are among the hardest to arbitrage away. Executives cannot easily control their pronoun usage, and the signal generators are unaware they are generating a signal. The psycholinguistics literature (Pennebaker, Larcker & Zakolyukina) has existed for decades without being operationalized into a trading factor.",
+  "universe": {
+    "universe_type": "auto",
+    "custom_tickers": null,
+    "min_price": 5.0,
+    "include_delisted": true
+  },
+  "signal": {
+    "signal_type": "numeric",
+    "signal_name": "ppr_divergence",
+    "higher_is_better": false,
+    "llm_model_used": null,
+    "llm_temperature": null,
+    "llm_seed": null,
+    "llm_is_deterministic": true,
+    "signal_source": null
+  },
+  "holding_period_days": 5,
+  "time_period": {
+    "start_date": "2018-01-01",
+    "end_date": "2025-05-01",
+    "oos_start_date": "2023-01-01",
+    "frequency": "quarterly"
+  },
+  "position_sizing": {
+    "method": "equal_weight",
+    "max_position_pct": 0.1,
+    "max_positions": 10,
+    "capital": 100000.0
+  },
+  "minimum_effect_size": {
+    "annualized_alpha_bps": 500,
+    "sharpe_ratio": 0.5,
+    "information_coefficient": 0.05,
+    "hit_rate": 0.55,
+    "max_drawdown_pct": 30.0
+  },
+  "data_sources": [
+    {
+      "source_type": "sec_filing",
+      "provider": "sec_edgar",
+      "frequency": "quarterly",
+      "fields": [
+        "10-K",
+        "10-Q",
+        "8-K"
+      ],
+      "start_date": "2018-01-01",
+      "end_date": "2025-05-01",
+      "known_biases": [
+        "EDGAR-filed transcripts may be subtly paraphrased — pronouns preserved but sentences restructured",
+        "Transcript fidelity pre-filter (>=5 first-person plural pronouns in Q&A) catches empty transcripts but may miss paraphrased ones",
+        "Per-executive baselines require 8+ quarters of history — excludes newly public companies and recent C-suite changes",
+        "Signal only fires after quarterly earnings calls — limited annual opportunity set per stock"
+      ],
+      "api_tier": "free",
+      "monthly_cost_usd": 0.0
+    },
+    {
+      "source_type": "price",
+      "provider": "yahoo",
+      "frequency": "daily",
+      "fields": [
+        "Close",
+        "Volume"
+      ],
+      "start_date": "2018-01-01",
+      "end_date": "2025-05-01",
+      "known_biases": [
+        "Survivorship bias for stocks delisted before ~2018",
+        "Corporate actions may lag 1-2 days"
+      ],
+      "api_tier": "free",
+      "monthly_cost_usd": 0.0
+    }
+  ],
+  "falsifiable_prediction": "Stocks with PPR below the executive's 10th percentile baseline should exhibit negative excess returns of at least 200bps over the subsequent 5 trading days. The effect must be asymmetric: PPR increases (above 90th percentile) should NOT predict positive returns. If both directions predict returns, the signal is just measuring executive emotional variability, not psychological distancing.",
+  "self_assessed_confidence": "MEDIUM",
+  "biggest_weakness": "Transcript fidelity: EDGAR-filed transcripts are sometimes cleaned/paraphrased in ways that alter pronoun ratios. The pre-filter (5+ first-person plural pronouns) catches empty transcripts but may not catch paraphrased ones. Phase 1 manual validation against audio recordings is essential before committing capital."
+}

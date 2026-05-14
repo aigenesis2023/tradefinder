@@ -51,13 +51,16 @@ _SEC_UA = os.environ.get("SEC_USER_AGENT", "")
 # comply with SEC's identification policy. Appending the tool identifier
 # after Safari/537.36 mimics the Edge/Chrome extension pattern and passes
 # the WAF, while still declaring our traffic as SEC requires.
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36 "
-    "TradeFinderResearch/1.0"
+# SEC-compliant User-Agent per https://www.sec.gov/privacy
+# Format: OrganizationName ContactEmail
+# The SEC explicitly requests: "declare your traffic by updating your
+# User-Agent to include your organization name and contact email."
+# Browser-mimetic strings are rejected by Akamai WAF as "Undeclared
+# Automated Tool" — the SEC wants honest identification, not disguise.
+_SEC_ORG_UA = (
+    "TradeFinderResearch/1.0 (research@tradefinder.dev)"
 )
-SEC_USER_AGENT = _SEC_UA if _SEC_UA else _BROWSER_UA
+SEC_USER_AGENT = _SEC_UA if _SEC_UA else _SEC_ORG_UA
 
 # Rate limiting: SEC allows 10 requests/second, but Akamai WAF has
 # undocumented burst limits that trigger at ~8 requests in rapid
@@ -241,10 +244,6 @@ class SECEdgarAdapter(DataAdapter):
             )
 
         df = pd.DataFrame(filings)
-        # Drop full_text to control memory — the extractor uses section
-        # columns (mda_text, risk_factors_text, business_text), not full_text.
-        # Full 10-K/10-Q text is 10-30MB per filing; sections are ~100KB-2MB.
-        df.drop(columns=["full_text"], inplace=True, errors="ignore")
 
         logger.info(
             f"SEC EDGAR adapter acquired {len(df)} filings "
@@ -411,6 +410,9 @@ class SECEdgarAdapter(DataAdapter):
                 "risk_factors_text": sections.get("risk_factors", ""),
                 "mda_text": sections.get("mda", ""),
                 "business_text": sections.get("business", ""),
+                "departure_text": sections.get("departure", ""),
+                "earnings_release_text": sections.get("earnings_release", ""),
+                "material_agreement_text": sections.get("material_agreement", ""),
                 "n_chars": len(clean_text),
             })
 
@@ -645,6 +647,39 @@ class SECEdgarAdapter(DataAdapter):
         ),
     }
 
+    # 8-K section patterns — Item-level extraction
+    SECTION_PATTERNS_8K = {
+        "departure": re.compile(
+            r"(?:ITEM|Item)\s*5\.02[\.\s]?\s*(?:Departure|Election)",
+            re.IGNORECASE,
+        ),
+        "earnings_release": re.compile(
+            r"(?:ITEM|Item)\s*2\.02[\.\s]?\s*(?:Results|Disclosure)",
+            re.IGNORECASE,
+        ),
+        "material_agreement": re.compile(
+            r"(?:ITEM|Item)\s*1\.01[\.\s]?\s*(?:Entry|Material)",
+            re.IGNORECASE,
+        ),
+        "other_events": re.compile(
+            r"(?:ITEM|Item)\s*8\.01[\.\s]?\s*(?:Other|Events)",
+            re.IGNORECASE,
+        ),
+        "amendments": re.compile(
+            r"(?:ITEM|Item)\s*5\.03[\.\s]?\s*(?:Amendments|Amendment)",
+            re.IGNORECASE,
+        ),
+        "regulation_fd": re.compile(
+            r"(?:ITEM|Item)\s*7\.01[\.\s]?\s*(?:Regulation|Reg\s*FD)",
+            re.IGNORECASE,
+        ),
+    }
+
+    # Next-section markers for 8-K (items are numbered, e.g., Item 1.01, Item 2.02)
+    _NEXT_SECTION_8K = re.compile(
+        r"\n\s*(?:ITEM|Item)\s*\d+\.\d+\s",
+    )
+
     # Next-section markers (anything that looks like a new Item heading)
     _NEXT_SECTION = re.compile(
         r"\n\s*(?:ITEM|Item)\s*\d+[A-Z]?\s*[\.\s]\s",
@@ -676,36 +711,45 @@ class SECEdgarAdapter(DataAdapter):
         For 10-K: Item 1A (Risk Factors), Item 7 (MD&A),
                   Item 1 (Business), Item 7A (Market Risk).
         For 10-Q: Part II Item 1A (Risk Factors), Item 2 (MD&A).
+        For 8-K:  Item 5.02 (Departure of Directors), Item 2.02 (Results),
+                  Item 1.01 (Material Agreements), Item 8.01 (Other Events).
         """
         form_upper = form_type.upper() if form_type else ""
-        if "10-K" not in form_upper and "10-Q" not in form_upper:
+
+        # Select the right pattern set
+        if "8-K" in form_upper:
+            patterns = cls.SECTION_PATTERNS_8K
+            next_section = cls._NEXT_SECTION_8K
+        elif "10-K" in form_upper or "10-Q" in form_upper:
+            patterns = cls.SECTION_PATTERNS
+            next_section = cls._NEXT_SECTION
+        else:
             return {}
 
         sections: Dict[str, str] = {}
 
-        for section_name, pattern in cls.SECTION_PATTERNS.items():
-            # Find ALL occurrences — the last one is the body section
-            # (the first is usually in the Table of Contents)
+        for section_name, pattern in patterns.items():
             all_matches = list(pattern.finditer(clean_text))
             if not all_matches:
                 continue
 
-            # Use the last match (body section, not TOC)
             match = all_matches[-1]
             start = match.start()
 
-            # Find the next section heading after this body section
             remaining = clean_text[match.end():]
-            next_match = cls._NEXT_SECTION.search(remaining)
+            next_match = next_section.search(remaining)
             if next_match:
                 end = match.end() + next_match.start()
             else:
-                # Take up to 100KB after the heading
                 end = min(start + 100000, len(clean_text))
 
             section_text = clean_text[start:end].strip()
-            if len(section_text) > 100:  # Sanity: real sections are > 100 chars
+            if len(section_text) > 100:
                 sections[section_name] = section_text
+
+        # Also include the full text as a fallback for LLM extraction
+        if sections and len(clean_text) > 200:
+            sections["full_text"] = clean_text
 
         return sections
 

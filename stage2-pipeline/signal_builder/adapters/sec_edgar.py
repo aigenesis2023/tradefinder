@@ -5,14 +5,11 @@ sec_edgar.py — SEC EDGAR Data Adapter
 Acquires SEC filings (10-K, 10-Q, 8-K, etc.) from sec.gov EDGAR system.
 
 Data sources (all free):
-  - SEC EDGAR full-text search API
-  - Direct filing access via sec.gov/Archives
-  - CIK lookup and company mapping
+  - SEC EDGAR submissions API (filing metadata, CIK lookup)
+  - Direct filing text download via sec.gov/Archives
+  - HTML-to-text extraction with section segmentation
 
-Status: FUNCTIONAL SKELETON — core acquisition works, some features stubbed.
-  Filing downloads are implemented. Full-text search via EDGAR API is
-  implemented for recent filings. Pre-2010 structured data parsing is
-  partially stubbed (relies on the raw text being extractable).
+Implements real filing downloads — no synthetic fallback.
 """
 
 from __future__ import annotations
@@ -46,20 +43,27 @@ logger = logging.getLogger(__name__)
 SEC_BASE = "https://www.sec.gov"
 SEC_ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
 SEC_SUBMISSIONS_API = "https://data.sec.gov/submissions"
-SEC_CIK_LOOKUP = "https://data.sec.gov/api/xbrl/companyfacts/CIK"
 
-# User-Agent required by SEC (they rate-limit/block without proper identification)
+# User-Agent required by SEC (rate-limit/block without proper identification)
 SEC_USER_AGENT = "TradeFinder/1.0.0 (research@example.com)"
+
+# Rate limiting: SEC allows 10 requests/second
+SEC_RATE_LIMIT_DELAY = 0.12
+
+# Maximum number of filings to download per ticker per query
+MAX_FILINGS_PER_TICKER = 20
 
 
 class SECEdgarAdapter(DataAdapter):
-    """Acquire SEC filings from EDGAR.
+    """Acquire SEC filings from EDGAR with real text download.
 
     Supports:
     - Filing download by ticker/CIK (10-K, 10-Q, 8-K, etc.)
-    - Full-text search via EDGAR API
-    - CIK lookup from ticker
-    - Form type filtering
+    - Full-text HTML download from sec.gov/Archives
+    - Section extraction (Risk Factors, MD&A, full text)
+    - File-based caching of downloaded filings
+
+    Rate limited to ~8 requests/second (SEC allows 10/s).
     """
 
     @property
@@ -68,38 +72,62 @@ class SECEdgarAdapter(DataAdapter):
 
     @property
     def version(self) -> str:
-        return "1.0.0"
+        return "2.0.0"
 
     def __init__(self, cache_dir: Optional[str] = None):
         self._cache_dir = cache_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "_cache", "sec_edgar"
         )
+        os.makedirs(self._cache_dir, exist_ok=True)
         self._user_agent = SEC_USER_AGENT
         self._ci_k_mapping: Dict[str, str] = {}
+        self._ticker_name_cache_path = os.path.join(self._cache_dir, "_ticker_cik_map.json")
+        self._load_cik_cache()
+
+    def _load_cik_cache(self):
+        """Load persisted CIK→ticker mapping."""
+        try:
+            if os.path.exists(self._ticker_name_cache_path):
+                with open(self._ticker_name_cache_path) as f:
+                    self._ci_k_mapping = json.load(f)
+        except Exception:
+            pass
+
+    def _save_cik_cache(self):
+        """Persist CIK→ticker mapping."""
+        try:
+            with open(self._ticker_name_cache_path, "w") as f:
+                json.dump(self._ci_k_mapping, f)
+        except Exception:
+            pass
 
     def health_check(self) -> Tuple[bool, str]:
         """Check if SEC EDGAR is accessible."""
         try:
             import requests
             headers = {"User-Agent": self._user_agent}
-            resp = requests.get(f"{SEC_SUBMISSIONS_API}/CIK0000320193.json", headers=headers, timeout=15)
+            resp = requests.get(
+                f"{SEC_SUBMISSIONS_API}/CIK0000320193.json",
+                headers=headers, timeout=15,
+            )
             return resp.status_code == 200, f"EDGAR accessible (status {resp.status_code})"
         except Exception as e:
             return False, f"EDGAR unreachable: {e}"
+
+    # ------------------------------------------------------------------
+    # Main acquisition
+    # ------------------------------------------------------------------
 
     def acquire(self, spec: DataSourceSpec) -> RawData:
         """Acquire SEC filings for specified tickers/CIKs and date range.
 
         Args:
-            spec: DataSourceSpec with fields specifying form types and tickers.
+            spec: DataSourceSpec with fields=list of form types and
+                  metadata.tickers=list of ticker symbols.
 
         Returns:
             RawData with filing text and metadata.
         """
-        # Extract parameters from spec
-        form_types = spec.fields if spec.fields else ["10-K", "10-Q"]
-        tickers = spec.metadata.get("tickers", []) if hasattr(spec, "metadata") else []
-
         try:
             import requests
         except ImportError:
@@ -109,16 +137,13 @@ class SECEdgarAdapter(DataAdapter):
                 missing_data="SEC filings",
             )
 
-        filings = []
-        errors = []
+        form_types = spec.fields if spec.fields else ["10-K", "10-Q"]
+        tickers = spec.metadata.get("tickers", []) if hasattr(spec, "metadata") else []
 
-        if not tickers:
-            # Without tickers, try to get recent filings by form type
-            try:
-                filings = self._search_recent_filings(form_types, spec.start_date, spec.end_date)
-            except Exception as e:
-                errors.append(f"Recent filing search failed: {e}")
-        else:
+        filings: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        if tickers:
             for ticker in tickers:
                 try:
                     ticker_filings = self._get_filings_for_ticker(
@@ -126,9 +151,16 @@ class SECEdgarAdapter(DataAdapter):
                     )
                     filings.extend(ticker_filings)
                 except Exception as e:
-                    errors.append(f"Failed to get filings for {ticker}: {e}")
-            # Rate limiting
-            time.sleep(0.1)
+                    msg = f"Failed to get filings for {ticker}: {e}"
+                    logger.warning(msg)
+                    errors.append(msg)
+        else:
+            try:
+                filings = self._search_recent_filings(
+                    form_types, spec.start_date, spec.end_date
+                )
+            except Exception as e:
+                errors.append(f"Recent filing search failed: {e}")
 
         if not filings:
             raise DataAcquisitionError(
@@ -143,7 +175,7 @@ class SECEdgarAdapter(DataAdapter):
         df = pd.DataFrame(filings)
         logger.info(
             f"SEC EDGAR adapter acquired {len(df)} filings "
-            f"for {len(tickers)} tickers ({spec.start_date} to {spec.end_date})"
+            f"for {df['ticker'].nunique()} tickers ({spec.start_date} to {spec.end_date})"
         )
 
         return RawData(
@@ -152,16 +184,21 @@ class SECEdgarAdapter(DataAdapter):
             provider="sec_edgar",
             metadata={
                 "n_filings": len(df),
-                "n_tickers": len(tickers),
+                "n_tickers": df["ticker"].nunique(),
                 "form_types": form_types,
                 "errors": errors,
             },
         )
 
+    # ------------------------------------------------------------------
+    # CIK lookup
+    # ------------------------------------------------------------------
+
     def _lookup_cik(self, ticker: str) -> Optional[str]:
-        """Look up CIK number from ticker symbol."""
-        if ticker in self._ci_k_mapping:
-            return self._ci_k_mapping[ticker]
+        """Look up CIK number from ticker symbol (with caching)."""
+        ticker_upper = ticker.upper()
+        if ticker_upper in self._ci_k_mapping:
+            return self._ci_k_mapping[ticker_upper]
 
         try:
             import requests
@@ -170,42 +207,371 @@ class SECEdgarAdapter(DataAdapter):
             resp = requests.get(url, headers=headers, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
-                ticker_upper = ticker.upper()
                 for entry in data.values():
                     if entry.get("ticker", "").upper() == ticker_upper:
                         cik = str(entry["cik_str"]).zfill(10)
-                        self._ci_k_mapping[ticker] = cik
+                        self._ci_k_mapping[ticker_upper] = cik
+                        self._save_cik_cache()
                         return cik
         except Exception as e:
             logger.warning(f"CIK lookup failed for {ticker}: {e}")
 
         return None
 
+    # ------------------------------------------------------------------
+    # Filing download
+    # ------------------------------------------------------------------
+
     def _get_filings_for_ticker(
         self, ticker: str, form_types: List[str], start_date: str, end_date: str
     ) -> List[Dict[str, Any]]:
-        """Get filings for a specific ticker from SEC EDGAR.
+        """Download real SEC filings for a ticker.
 
-        STUB: Returns an empty list in this skeleton. Full implementation would:
         1. Look up CIK from ticker
-        2. Query the submissions API for recent filings
-        3. Download filing text from sec.gov/Archives
-        4. Parse HTML/plain-text into structured sections
+        2. Query submissions API for recent filings
+        3. Filter by form type and date
+        4. Download full text from SEC Archives
+        5. Extract sections (MD&A, Risk Factors)
         """
-        return []
+        import requests
+
+        cik = self._lookup_cik(ticker)
+        if not cik:
+            logger.warning(f"No CIK found for ticker {ticker}")
+            return []
+
+        cik_stripped = cik.lstrip("0")
+        headers = {"User-Agent": self._user_agent}
+
+        # Query submissions API
+        submissions_url = f"{SEC_SUBMISSIONS_API}/CIK{cik}.json"
+        try:
+            resp = requests.get(submissions_url, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                logger.warning(f"Submissions API returned {resp.status_code} for {ticker}")
+                return []
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"Submissions API failed for {ticker}: {e}")
+            return []
+
+        recent = data.get("filings", {}).get("recent", {})
+        if not recent:
+            return []
+
+        accession_numbers = recent.get("accessionNumber", [])
+        form_list = recent.get("form", [])
+        filing_dates = recent.get("filingDate", [])
+        primary_docs = recent.get("primaryDocument", [])
+        report_dates = recent.get("reportDate", [])
+
+        form_set = set(f.upper() for f in form_types)
+        filings = []
+        downloaded = 0
+
+        for i, acc in enumerate(accession_numbers):
+            if downloaded >= MAX_FILINGS_PER_TICKER:
+                break
+
+            form = (form_list[i] if i < len(form_list) else "").upper()
+            date = filing_dates[i] if i < len(filing_dates) else ""
+            primary = primary_docs[i] if i < len(primary_docs) else ""
+            report_date = report_dates[i] if i < len(report_dates) else ""
+
+            if form not in form_set:
+                continue
+            if date and (date < start_date or date > end_date):
+                continue
+
+            # Download the filing text
+            filing_text = self._download_filing_text(
+                cik_stripped, acc, primary, headers
+            )
+            if not filing_text:
+                continue
+
+            # Extract sections
+            sections = self._extract_filing_sections(filing_text, form)
+            clean_text = self._strip_html(filing_text)
+
+            filings.append({
+                "cik": cik_stripped,
+                "ticker": ticker.upper(),
+                "filing_date": date,
+                "report_date": report_date,
+                "form_type": form,
+                "accession_number": acc,
+                "primary_document": primary,
+                "full_text": clean_text,
+                "risk_factors_text": sections.get("risk_factors", ""),
+                "mda_text": sections.get("mda", ""),
+                "business_text": sections.get("business", ""),
+                "n_chars": len(clean_text),
+            })
+
+            downloaded += 1
+            time.sleep(SEC_RATE_LIMIT_DELAY)
+
+        logger.info(
+            f"Downloaded {len(filings)} {', '.join(form_types)} filings "
+            f"for {ticker} ({start_date} to {end_date})"
+        )
+        return filings
+
+    def _download_filing_text(
+        self,
+        cik_stripped: str,
+        accession: str,
+        primary_doc: str,
+        headers: Dict[str, str],
+    ) -> Optional[str]:
+        """Download the full text of a filing from SEC Archives.
+
+        URL pattern:
+          /Archives/edgar/data/{CIK}/{acc_no_dashes}/{acc_no}.txt
+
+        Falls back to the primary document if the full submission isn't
+        available as .txt.
+        """
+        import requests
+
+        acc_no_dashes = accession.replace("-", "")
+
+        # Check cache first
+        cache_key = f"{cik_stripped}_{acc_no_dashes}"
+        cached = self._get_cached_filing(cache_key)
+        if cached is not None:
+            return cached
+
+        # Primary URL: full submission text file
+        url = (
+            f"{SEC_ARCHIVES}/{cik_stripped}/{acc_no_dashes}/"
+            f"{accession}.txt"
+        )
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=60)
+            if resp.status_code == 200:
+                text = resp.text
+                # Only cache if it looks like a real filing
+                if len(text) > 1000 and "<SEC-DOCUMENT>" in text[:500]:
+                    self._cache_filing(cache_key, text)
+                    return text
+                return text
+
+            # Fallback: try the primary document directly
+            if primary_doc:
+                fallback_url = (
+                    f"{SEC_ARCHIVES}/{cik_stripped}/{acc_no_dashes}/"
+                    f"{primary_doc}"
+                )
+                resp2 = requests.get(fallback_url, headers=headers, timeout=60)
+                if resp2.status_code == 200:
+                    text = resp2.text
+                    if len(text) > 1000:
+                        self._cache_filing(cache_key, text)
+                        return text
+
+        except Exception as e:
+            logger.warning(f"Download failed for {accession}: {e}")
+
+        return None
+
+    # ------------------------------------------------------------------
+    # HTML stripping
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        """Strip HTML/SGML tags and return clean text.
+
+        Uses BeautifulSoup when available, falls back to regex.
+        """
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(text, "html.parser")
+            # Remove script and style elements
+            for tag in soup(["script", "style", "meta", "link"]):
+                tag.decompose()
+            clean = soup.get_text(separator="\n")
+        except ImportError:
+            # Fallback: regex-based tag stripping
+            clean = re.sub(r"<[^>]+>", " ", text)
+            clean = re.sub(r"&[a-z]+;", " ", clean)
+
+        # Collapse whitespace
+        clean = re.sub(r"\n\s*\n", "\n\n", clean)
+        clean = re.sub(r"[ \t]+", " ", clean)
+        clean = re.sub(r"\n{3,}", "\n\n", clean)
+        return clean.strip()
+
+    # ------------------------------------------------------------------
+    # Section extraction
+    # ------------------------------------------------------------------
+
+    # Section header patterns for 10-K and 10-Q filings
+    SECTION_PATTERNS = {
+        "risk_factors": re.compile(
+            r"(?:ITEM|Item)\s*1A[\.\s]\s*Risk\s*Factors",
+            re.IGNORECASE,
+        ),
+        "mda": re.compile(
+            r"(?:ITEM|Item)\s*7[\.\s]\s*Management(?:'s|’s)?\s*Discussion",
+            re.IGNORECASE,
+        ),
+        "business": re.compile(
+            r"(?:ITEM|Item)\s*1[\.\s]\s*Business",
+            re.IGNORECASE,
+        ),
+        "market_risk": re.compile(
+            r"(?:ITEM|Item)\s*7A[\.\s]\s*Quantitative",
+            re.IGNORECASE,
+        ),
+        "legal_proceedings": re.compile(
+            r"(?:ITEM|Item)\s*3[\.\s]\s*Legal\s*Proceedings",
+            re.IGNORECASE,
+        ),
+    }
+
+    # Next-section markers (anything that looks like a new Item heading)
+    _NEXT_SECTION = re.compile(
+        r"\n\s*(?:ITEM|Item)\s*\d+[A-Z]?\s*[\.\s]\s",
+    )
+
+    @classmethod
+    def _extract_filing_sections(
+        cls, raw_text: str, form_type: str
+    ) -> Dict[str, str]:
+        """Extract key sections from a filing's raw text.
+
+        Section headers appear twice in SEC filings: once in the Table of
+        Contents (early in the document) and once in the body. We use the
+        LAST occurrence of each header — the body section.
+
+        For 10-K: Item 1A (Risk Factors), Item 7 (MD&A),
+                  Item 1 (Business), Item 7A (Market Risk).
+        For 10-Q: Part II Item 1A (Risk Factors), Item 2 (MD&A).
+        """
+        # Strip HTML for section boundary detection
+        clean = cls._strip_html(raw_text)
+
+        form_upper = form_type.upper() if form_type else ""
+        if "10-K" not in form_upper and "10-Q" not in form_upper:
+            return {}
+
+        sections: Dict[str, str] = {}
+
+        for section_name, pattern in cls.SECTION_PATTERNS.items():
+            # Find ALL occurrences — the last one is the body section
+            # (the first is usually in the Table of Contents)
+            all_matches = list(pattern.finditer(clean))
+            if not all_matches:
+                continue
+
+            # Use the last match (body section, not TOC)
+            match = all_matches[-1]
+            start = match.start()
+
+            # Find the next section heading after this body section
+            remaining = clean[match.end():]
+            next_match = cls._NEXT_SECTION.search(remaining)
+            if next_match:
+                end = match.end() + next_match.start()
+            else:
+                # Take up to 100KB after the heading
+                end = min(start + 100000, len(clean))
+
+            section_text = clean[start:end].strip()
+            if len(section_text) > 100:  # Sanity: real sections are > 100 chars
+                sections[section_name] = section_text
+
+        return sections
+
+    # ------------------------------------------------------------------
+    # Tickerless search
+    # ------------------------------------------------------------------
 
     def _search_recent_filings(
         self, form_types: List[str], start_date: str, end_date: str
     ) -> List[Dict[str, Any]]:
-        """Search for recent filings by form type using EDGAR full-text search.
+        """Search for recent filings by form type.
 
-        STUB: Returns an empty list in this skeleton.
+        When no tickers are specified, downloads a sample of filings
+        from the EDGAR full-text search API.
         """
-        return []
+        import requests
+
+        filings: List[Dict[str, Any]] = []
+        headers = {"User-Agent": self._user_agent}
+
+        for form_type in form_types[:2]:  # Limit breadth
+            query = (
+                f"https://efts.sec.gov/LATEST/search-index?"
+                f"q=formType:{form_type}&dateRange=custom&"
+                f"startdt={start_date}&enddt={end_date}&"
+                f"from=0&size=20"
+            )
+            try:
+                resp = requests.get(query, headers=headers, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    hits = data.get("hits", {}).get("hits", [])
+                    for hit in hits[:10]:
+                        source = hit.get("_source", {})
+                        cik = source.get("cik", "")
+                        ticker = source.get("tickers", [""])[0] if source.get("tickers") else ""
+                        accession = source.get("adsh", "")
+                        if cik and accession:
+                            text = self._download_filing_text(
+                                str(cik).zfill(10), accession, "", headers
+                            )
+                            if text:
+                                filings.append({
+                                    "cik": cik,
+                                    "ticker": ticker,
+                                    "filing_date": source.get("filedAt", "")[:10],
+                                    "form_type": form_type,
+                                    "accession_number": accession,
+                                    "full_text": self._strip_html(text),
+                                    "n_chars": len(text),
+                                })
+                            time.sleep(SEC_RATE_LIMIT_DELAY)
+            except Exception as e:
+                logger.warning(f"Full-text search failed for {form_type}: {e}")
+
+        return filings
+
+    # ------------------------------------------------------------------
+    # Caching
+    # ------------------------------------------------------------------
+
+    def _get_cached_filing(self, key: str) -> Optional[str]:
+        """Retrieve a cached filing from disk."""
+        cache_path = os.path.join(self._cache_dir, f"{key}.txt")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                pass
+        return None
+
+    def _cache_filing(self, key: str, text: str):
+        """Cache a filing to disk."""
+        cache_path = os.path.join(self._cache_dir, f"{key}.txt")
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            logger.debug(f"Failed to cache filing {key}: {e}")
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
     def validate(self, raw_data: RawData) -> Tuple[bool, List[str]]:
         """Validate SEC filing data."""
-        issues = []
+        issues: List[str] = []
         valid, basic_issues = raw_data.validate()
         issues.extend(basic_issues)
         if not valid:
@@ -216,5 +582,10 @@ class SECEdgarAdapter(DataAdapter):
         for col in required_cols:
             if col not in df.columns:
                 issues.append(f"Missing required column: {col}")
+
+        if "full_text" not in df.columns:
+            issues.append("Missing full_text column (filing text not downloaded)")
+        elif df["full_text"].apply(lambda x: len(str(x)) if pd.notna(x) else 0).mean() < 100:
+            issues.append("Average full_text length < 100 chars — likely download failure")
 
         return len(issues) == 0, issues

@@ -171,6 +171,16 @@ class SignalBuilder:
         for ds in data_sources:
             provider_map.setdefault(ds.provider, []).append(ds)
 
+        # Inject universe tickers into data source metadata so adapters
+        # know which tickers to fetch (tickers live in universe, not in
+        # the data source spec, but adapters need them).
+        universe_tickers = hypothesis.universe.custom_tickers or []
+        if universe_tickers:
+            for specs in provider_map.values():
+                for spec in specs:
+                    if not spec.metadata.get("tickers"):
+                        spec.metadata["tickers"] = universe_tickers
+
         # Step 3: Acquire raw data from each adapter
         all_raw_data: Dict[str, RawData] = {}
         for provider, specs in provider_map.items():

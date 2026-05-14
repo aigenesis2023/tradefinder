@@ -6,3 +6,7 @@ __pycache__/
 dist/
 build/
 .env
+stage2-pipeline/results/
+stage2-pipeline/signal_builder/_cache/
+*.parquet
+*.log

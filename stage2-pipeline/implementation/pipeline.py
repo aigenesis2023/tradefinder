@@ -171,6 +171,7 @@ class DataSourceSpec:
     known_biases: List[str] = field(default_factory=list)
     api_tier: str = "free"    # 'free' | 'paid_low_cost' | 'paid_premium'
     monthly_cost_usd: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -633,8 +633,10 @@ class LinguisticExtractor(SignalExtractor):
         signal_col = params.get("signal_column", "composite_score")
         if signal_col not in features_df.columns:
             # Fall back to any recognizable signal
-            signal_candidates = ["composite_score", "benefit_hedge_density",
-                                "benefit_certainty_density", "risk_hedge_density"]
+            signal_candidates = ["composite_score",
+                                 "full_hedge_density", "general_hedge_density",
+                                 "risk_hedge_density", "mda_hedge_density",
+                                 "benefit_hedge_density", "benefit_certainty_density"]
             for cand in signal_candidates:
                 if cand in features_df.columns:
                     signal_col = cand
@@ -664,7 +666,16 @@ class LinguisticExtractor(SignalExtractor):
                 f"Available: {list(features_df.columns)}",
             )
 
-        signal_value = features_df[signal_col].values if signal_col in features_df.columns else features_df["benefit_hedge_density"].values
+        if signal_col in features_df.columns:
+            signal_value = features_df[signal_col].values
+        else:
+            # Last resort: find any column with "hedge_density" or "density" in name
+            fallback_cols = [c for c in features_df.columns if "density" in c.lower()]
+            if fallback_cols:
+                signal_value = features_df[fallback_cols[0]].values
+            else:
+                # Absolute fallback: use row index as dummy signal
+                signal_value = list(range(len(features_df)))
 
         # Pivot: date index, id columns, signal value
         features_df["_date_parsed"] = pd.to_datetime(features_df[date_col], errors="coerce")

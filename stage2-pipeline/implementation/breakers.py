@@ -216,18 +216,19 @@ class StatisticalBreaker:
         perm_performances = np.zeros(self.n_permutations)
 
         for i in range(self.n_permutations):
-            # Shuffle signals INDEPENDENTLY for each ticker to preserve
-            # cross-sectional structure but destroy temporal relationship
+            # Shuffle signals CROSS-SECTIONALLY within each date to destroy
+            # the signal-return relationship while preserving the distribution
+            # of signal values at each point in time.
             shuffled_signals = signals.copy()
 
-            for ticker in signals.columns:
-                ticker_signals = signals[ticker].dropna().values.copy()  # .copy() prevents read-only array error
-                if len(ticker_signals) > 1:
-                    self.rng.shuffle(ticker_signals)
-                    shuffled_signals[ticker] = pd.Series(
-                        ticker_signals,
-                        index=signals[ticker].dropna().index,
-                    )
+            for date_idx in range(shuffled_signals.shape[0]):
+                row = shuffled_signals.iloc[date_idx].values.copy()
+                nan_mask = np.isnan(row)
+                valid_vals = row[~nan_mask]
+                if len(valid_vals) > 1:
+                    self.rng.shuffle(valid_vals)
+                    row[~nan_mask] = valid_vals
+                shuffled_signals.iloc[date_idx] = row
 
             perm_performances[i] = backtest_func(shuffled_signals, forward_returns)
 

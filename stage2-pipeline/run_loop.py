@@ -440,8 +440,84 @@ Examples:
                         help="Force synthetic data in signal builder")
     parser.add_argument("--fmp-key", default=None,
                         help="FMP API key for pipeline")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run 4-tier calibration before hypothesis testing")
+    parser.add_argument("--calibrate-only", action="store_true",
+                        help="Run calibration only (skip hypothesis testing)")
+    parser.add_argument("--calibration-tickers", nargs="*", default=None,
+                        help="Tickers for calibration (auto-selects S&P 500 if omitted)")
+    parser.add_argument("--calibration-n-tickers", type=int, default=100,
+                        help="Number of tickers to auto-select for calibration (default: 100)")
+    parser.add_argument("--calibration-start", default="2021-01-01",
+                        help="Start date for calibration price data (YYYY-MM-DD)")
+    parser.add_argument("--calibration-end", default="2024-12-31",
+                        help="End date for calibration price data (YYYY-MM-DD)")
+    parser.add_argument("--calibration-n-tier4", type=int, default=20,
+                        help="Number of random signals for Tier 4 null distribution (default: 20)")
 
     args = parser.parse_args()
+
+    # -------------------------------------------------------------------
+    # Calibration (if requested)
+    # -------------------------------------------------------------------
+    if args.calibrate or args.calibrate_only:
+        print("=" * 70)
+        print("RUNNING 4-TIER CALIBRATION PIPELINE")
+        print("=" * 70)
+
+        try:
+            from implementation.calibration import CalibrationRunner
+
+            calib_dir = os.path.join(args.output, "calibration")
+            runner = CalibrationRunner(
+                output_dir=calib_dir,
+                verbose=args.verbose,
+                fmp_api_key=args.fmp_key,
+                n_random_tier4=args.calibration_n_tier4,
+            )
+            runner.load_price_data(
+                tickers=args.calibration_tickers,
+                start=args.calibration_start,
+                end=args.calibration_end,
+                n_tickers=args.calibration_n_tickers,
+            )
+            calib_report = runner.run_all()
+            calib_path = runner.save_report(calib_report)
+
+            print(f"\nCalibration report: {calib_path}")
+            print(f"Pipeline health: {calib_report.pipeline_health}")
+            print(f"Overall pass: {calib_report.overall_pass}")
+            if calib_report.mde_bps:
+                print(f"MDE (80% power): {calib_report.mde_bps:.0f} bps")
+            if calib_report.empirical_fpr_pct:
+                print(f"Empirical FPR: {calib_report.empirical_fpr_pct:.1f}%")
+            print()
+
+            if not calib_report.overall_pass:
+                print("CALIBRATION FAILED — pipeline is miscalibrated.")
+                for rec in calib_report.recommendations:
+                    print(f"  → {rec}")
+                if args.calibrate_only:
+                    sys.exit(4)
+                print("Proceeding with hypothesis testing anyway (--calibrate, not --calibrate-only)...")
+                print()
+
+            if args.calibrate_only:
+                sys.exit(0 if calib_report.overall_pass else 4)
+
+        except ImportError as e:
+            print(f"ERROR: Calibration module not available: {e}", file=sys.stderr)
+            if args.calibrate_only:
+                sys.exit(3)
+        except Exception as e:
+            print(f"ERROR: Calibration failed: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            if args.calibrate_only:
+                sys.exit(3)
+
+    if args.calibrate_only:
+        sys.exit(0)
 
     if not os.path.exists(args.hypothesis):
         print(f"ERROR: Hypothesis file not found: {args.hypothesis}", file=sys.stderr)

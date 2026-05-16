@@ -392,7 +392,28 @@ class UniverseBuilder:
         if n_after_format < n_before:
             logger.info(f"  Removed {n_before - n_after_format} non-standard tickers (warrants/rights/units/etc.)")
 
-        # 2. Sector filter: match company title against sector keywords.
+        # 2. Remove SPACs and shell companies by title keywords.
+        _SPAC_KEYWORDS = [
+            "acquisition corp", "acquisition co", "acquisition inc",
+            "spac", "blank check", "special purpose acquisition",
+            "capital corp", "capital inc", "holding corp", "holdings corp",
+            "shell company", "development stage",
+        ]
+
+        def _is_spac(t: str) -> bool:
+            title = all_tickers.get(t, {}).get("title", "").lower()
+            return any(kw in title for kw in _SPAC_KEYWORDS)
+
+        tickers = [t for t in tickers if not _is_spac(t)]
+        n_after_spac = len(tickers)
+        if n_after_spac < n_after_format:
+            logger.info(f"  Removed {n_after_format - n_after_spac} SPAC/shell tickers")
+
+        # 3. Sort by CIK (lower = older SEC registration = generally more established).
+        #    This ensures the 50-ticker feasible cap picks blue-chips, not micro-caps.
+        tickers.sort(key=lambda t: int(all_tickers.get(t, {}).get("cik", 999999999)))
+
+        # 4. Sector filter: match company title against sector keywords.
         sectors = scope.get("sectors", [])
         if sectors:
             sector_keywords = {
@@ -572,28 +593,68 @@ class UniverseBuilder:
         """
         # Check if hypothesis has holding_period_days or other constraints.
         # MAX_FILINGS_PER_TICKER in sec_edgar.py caps actual downloads.
-        from signal_builder.adapters.sec_edgar import MAX_FILINGS_PER_TICKER as SEC_MAX_FILINGS
+        from signal_builder.adapters.sec_edgar import (
+            MAX_FILINGS_PER_TICKER as SEC_MAX_FILINGS,
+            MAX_FILINGS_PER_TICKER_8K as SEC_MAX_FILINGS_8K,
+        )
+        _, filing_types = self._derive_filing_types(hypothesis)
+        _is_8k_only = set(filing_types) == {"8-K"}
+        _max_per_ticker = SEC_MAX_FILINGS_8K if _is_8k_only else SEC_MAX_FILINGS
         n_filings_per_ticker = min(
             self._estimate_filings_per_ticker(hypothesis),
-            SEC_MAX_FILINGS,
+            _max_per_ticker,
         )
         est_requests_per_ticker = 2 + n_filings_per_ticker  # CIK lookup + filing list + downloads
 
-        # SEC download is the binding constraint (~5-15s per filing,
-        # 10-K text is 10-30MB HTML). Rate-limit delay (0.12s) is negligible
-        # relative to HTTP transfer + parsing time.
-        #
-        # Estimate: 2 API calls + N filing downloads per ticker.
-        # At ~8s per filing: (2 × 1s) + (filings × 8s) per ticker.
-        # Production: needs parallel downloads or pre-built filing database.
-        EST_SECONDS_PER_API_CALL = 1.0
-        EST_SECONDS_PER_FILING = 8.0
+        # SEC download + HTML parse times: 10-K text is 1-30MB HTML.
+        # Download: ~2-8s, lxml BeautifulSoup parse: ~20-90s.
+        # Total per-filing: ~30-120s for 10-K, ~2-10s for 8-K.
+        # Cached filings read at ~0.01s from disk (both raw + clean text cached).
+        EST_SECONDS_PER_API_CALL = 0.3
+        EST_SECONDS_PER_FILING_CACHED = 0.05
+        EST_SECONDS_PER_FILING_DOWNLOAD = 1.5 if _is_8k_only else 45.0  # download + parse
+
+        # Estimate cache hit rate from the filing cache directory
+        import os as _os2
+        _cache_dir = _os2.path.join(
+            _os2.path.dirname(_os2.path.abspath(__file__)),
+            "_cache", "sec_edgar",
+        )
+        _n_cached = 0
+        _n_clean_cached = 0
+        try:
+            _n_cached = len([
+                f for f in _os2.listdir(_cache_dir)
+                if f.endswith(".txt") and not f.startswith("_")
+            ])
+            _n_clean_cached = len([
+                f for f in _os2.listdir(_cache_dir)
+                if f.endswith(".clean.txt")
+            ])
+        except Exception:
+            pass
+
+        # Cache hit rate depends on both raw and clean text being cached.
+        # If both are present, the run is near-instant.
+        if _n_clean_cached > 4000:
+            _cache_hit_rate = 0.90
+        elif _n_clean_cached > 1500:
+            _cache_hit_rate = 0.70
+        elif _n_clean_cached > 500:
+            _cache_hit_rate = 0.40
+        else:
+            _cache_hit_rate = 0.10
+
+        EST_SECONDS_PER_FILING = (
+            _cache_hit_rate * EST_SECONDS_PER_FILING_CACHED
+            + (1.0 - _cache_hit_rate) * EST_SECONDS_PER_FILING_DOWNLOAD
+        )
         est_seconds_per_ticker = (
             2 * EST_SECONDS_PER_API_CALL
             + n_filings_per_ticker * EST_SECONDS_PER_FILING
         )
-        max_runtime_seconds = 1080  # target ~18 min
-        feasible_tickers = int(max_runtime_seconds / max(est_seconds_per_ticker, 1.0))
+        max_runtime_seconds = 7200  # target ~2 hours for deep cache penetration
+        feasible_tickers = int(max_runtime_seconds / max(est_seconds_per_ticker, 0.001))
 
         # Cap at reasonable limits
         feasible_tickers = min(feasible_tickers, len(tickers))
@@ -601,9 +662,10 @@ class UniverseBuilder:
         feasible_tickers = min(feasible_tickers, 3000)  # never exceed 3000
 
         logger.info(
-            f"Feasible ticker cap: {feasible_tickers} "
-            f"(est {est_requests_per_ticker} req/ticker, "
-            f"~{feasible_tickers * est_requests_per_ticker * SEC_RATE_LIMIT_DELAY:.0f}s runtime)"
+            f"Cache-aware ticker cap: {feasible_tickers} "
+            f"(cache hit rate ~{_cache_hit_rate:.0%} from {_n_cached} files, "
+            f"est {est_seconds_per_ticker:.1f}s/ticker, "
+            f"{n_filings_per_ticker} filings/ticker)"
         )
 
         return feasible_tickers

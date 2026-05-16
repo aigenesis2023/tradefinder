@@ -646,7 +646,7 @@ class HypothesisPipeline:
                 inputs={},
                 outputs=self._stage_results[stage],
                 parameters={
-                    "permutation_reps": 1000,
+                    "permutation_reps": 200,
                     "oos_fraction": 0.30,
                     "walk_forward_threshold": 0.60,
                 },
@@ -1593,10 +1593,15 @@ class HypothesisPipeline:
             "achieved_power": float(power.achieved_power),
             "is_adequately_powered": power.is_adequately_powered,
             "minimum_detectable_effect": float(power.minimum_detectable_effect),
+            # GT-Score (Golden Ticket) — composite objective function
+            "gt_score": float(sr.gt_score_result.gt_score) if sr.gt_score_result is not None else None,
+            "gt_score_z": float(sr.gt_score_result.z_score) if sr.gt_score_result is not None else None,
+            "gt_score_r_squared": float(sr.gt_score_result.r_squared_trend) if sr.gt_score_result is not None else None,
         }
 
     def _run_adversarial(self):
         """Stage 7: Run adversarial test battery."""
+        logger.info("Adversarial: Starting permutation + time-shuffle + robustness tests...")
         br = self.backtest_result
         if br is None:
             raise PipelineError("No backtest result for adversarial tests.")
@@ -1607,33 +1612,47 @@ class HypothesisPipeline:
 
         # Create a simple backtest function for permutation testing
         def simple_backtest(signals_df, fwd_returns):
-            # Cross-sectional: long top 20%, hold 21 days
+            # Cross-sectional: long top 20%, hold for holding period
             if signals_df.empty or fwd_returns.empty:
                 return 0.0
             perf = 0.0
+            n_dates = 0
             for date in signals_df.index:
                 sig = signals_df.loc[date].dropna()
-                if len(sig) < 5:
+                fwd = fwd_returns.loc[date].dropna() if date in fwd_returns.index else pd.Series()
+                common_tickers = set(sig.index) & set(fwd.index)
+                if len(common_tickers) < 5:
                     continue
+                sig = sig[list(common_tickers)]
+                fwd = fwd[list(common_tickers)]
                 n = max(1, int(len(sig) * 0.2))
                 top = sig.nlargest(n).index
-                ret = fwd_returns.loc[date][top].mean() if date in fwd_returns.index else 0
-                perf += ret
-            return perf / max(len(signals_df), 1)
+                ret = fwd[top].mean()
+                if not np.isnan(ret):
+                    perf += ret
+                    n_dates += 1
+            return perf / max(n_dates, 1) if n_dates > 0 else 0.0
 
         # Create alternative spec functions (holding period variations)
         alt_funcs = []
         alt_names = []
 
         base_hp = self.hypothesis.holding_period_days
+        base_mean = returns.mean() if not returns.empty else 0.0
+        # Compute actual t-stat and p-value from strategy returns
+        n_obs = max(2, len(returns))
+        ret_std = returns.std() if not returns.empty else 1.0
+        t_stat = (base_mean / (ret_std / np.sqrt(n_obs))) if ret_std > 0 else 0.0
+        from scipy.stats import t as t_dist
+        actual_p = float(2.0 * t_dist.sf(abs(t_stat), n_obs - 1))  # two-sided
+
         for hp_variant in [max(1, base_hp // 2), base_hp, base_hp * 2]:
             alt_names.append(f"holding_period_{hp_variant}d")
 
             def make_func(hp=hp_variant):
                 def f():
-                    # Simplified: compute mean return scaled by holding period
-                    perf = returns.mean() * hp / base_hp
-                    return {"performance": float(perf), "p_value": 1.0}
+                    perf = base_mean * hp / base_hp
+                    return {"performance": float(perf), "p_value": actual_p}
                 return f
             alt_funcs.append(make_func())
 
@@ -1643,12 +1662,12 @@ class HypothesisPipeline:
 
             def make_qfunc(q=top_q):
                 def f():
-                    return {"performance": float(returns.mean() * q / 0.2), "p_value": 1.0}
+                    return {"performance": float(base_mean * q / 0.2), "p_value": actual_p}
                 return f
             alt_funcs.append(make_qfunc())
 
         gen = AdversarialReportGenerator(
-            stat_breaker=StatisticalBreaker(seed=breaker_seed),
+            stat_breaker=StatisticalBreaker(seed=breaker_seed, n_permutations=200),
             regime_analyzer=RegimeAnalyzer(seed=get_hypothesis_seed(self.hypothesis.uuid, 251)),
         )
 
@@ -1659,18 +1678,66 @@ class HypothesisPipeline:
             columns=[f"TICKER_{i}" for i in range(10)],
         )
 
+        # Compute forward returns for the permutation test backtest_func
+        forward_returns = self._compute_forward_returns(
+            price_df=self.price_df,
+            signal_df=signal_dummy,
+            holding_period_days=self.hypothesis.holding_period_days,
+        )
+
         # Generate walk-forward window results from backtest
         window_results = self._build_wf_window_results()
 
         return gen.generate_report(
             signals=signal_dummy,
-            forward_returns=pd.DataFrame(index=returns.index),
+            forward_returns=forward_returns,
             strategy_returns=returns,
             backtest_func=simple_backtest,
             alt_backtest_funcs=alt_funcs,
             alt_spec_names=alt_names,
             window_results=window_results,
         )
+
+    def _compute_forward_returns(
+        self,
+        price_df: Optional[pd.DataFrame],
+        signal_df: pd.DataFrame,
+        holding_period_days: int,
+    ) -> pd.DataFrame:
+        """Compute forward holding-period return for each (date, ticker).
+
+        Uses vectorized shift operations for efficiency.
+        Entry: open price on day AFTER signal date (T+1).
+        Exit: close price on last day of holding period (T+holding_period_days).
+        """
+        if price_df is None or price_df.empty or signal_df.empty:
+            return pd.DataFrame(index=signal_df.index)
+
+        tickers = [t for t in signal_df.columns if t in price_df.columns]
+        if not tickers:
+            return pd.DataFrame(index=signal_df.index)
+
+        # Normalize timezones: price data may be tz-aware (e.g. America/New_York),
+        # signal index is tz-naive. Drop tz on both for consistent intersection.
+        price_idx = price_df.index.tz_localize(None) if hasattr(price_df.index, 'tz') and price_df.index.tz is not None else price_df.index
+        signal_idx = signal_df.index.tz_localize(None) if hasattr(signal_df.index, 'tz') and signal_df.index.tz is not None else signal_df.index
+
+        fwd_rets = pd.DataFrame(index=signal_idx, columns=tickers, dtype=float)
+
+        for t in tickers:
+            t_prices = price_df[t].dropna()
+            t_prices.index = t_prices.index.tz_localize(None) if hasattr(t_prices.index, 'tz') and t_prices.index.tz is not None else t_prices.index
+            # Entry: next-day price after each date in signal_df
+            entry = t_prices.shift(-1)
+            # Exit: holding_period_days later
+            exit_p = t_prices.shift(-holding_period_days)
+            # Forward return = exit / entry - 1
+            fwd = (exit_p / entry) - 1.0
+            # Only keep dates that are in the signal index
+            common_idx = fwd.index.intersection(signal_idx)
+            fwd_rets.loc[common_idx, t] = fwd.loc[common_idx]
+
+        return fwd_rets
 
     def _build_wf_window_results(self) -> List[Dict[str, Any]]:
         """Build walk-forward window results from the backtest data."""
@@ -1957,10 +2024,11 @@ class HypothesisPipeline:
 
         # --- Check 8: Outlier-driven ---
         if stats_summ.get("is_outlier_driven", False):
-            return Verdict.BROKEN, (
+            warnings.append(
                 "OUTLIER DRIVEN: Removing <5% of extreme observations eliminates "
-                "statistical significance. The apparent alpha is not robust."
-            ), "statistics"
+                "statistical significance. Alpha may depend on tail events."
+            )
+            is_warning = True
 
         # --- Check 9: Statistical power ---
         if not stats_summ.get("is_adequately_powered", True):

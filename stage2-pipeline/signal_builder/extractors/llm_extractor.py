@@ -142,6 +142,15 @@ class LLMExtractor(SignalExtractor):
             logger.info("LLMExtractor: No text data found, falling back to synthetic")
             return self._extract_synthetic(synth_data)
 
+        # Filter to rows where the most specific text column has content.
+        # This avoids sending irrelevant filings (e.g., 10-K MD&A text) to
+        # the LLM when the hypothesis targets a specific section (e.g.,
+        # departure_text from 8-K Item 5.02).
+        text_records = self._filter_relevant_rows(text_records)
+        if text_records is None or text_records.empty:
+            logger.info("LLMExtractor: No relevant text rows after filtering, falling back to synthetic")
+            return self._extract_synthetic(synth_data)
+
         signal_name = params.get("signal_name") or hypothesis.signal.signal_name
         higher_is_better = params.get("higher_is_better", False) or hypothesis.signal.higher_is_better
 
@@ -168,7 +177,8 @@ class LLMExtractor(SignalExtractor):
 
         # Extract signals using LLM
         signals = []
-        for idx, row in text_records.iterrows():
+        n_total = len(text_records)
+        for i, (idx, row) in enumerate(text_records.iterrows()):
             try:
                 result = self._extract_single(
                     text=self._get_best_text(row),
@@ -181,8 +191,15 @@ class LLMExtractor(SignalExtractor):
                 )
                 if result is not None:
                     signals.append(result)
+                    if len(signals) % 10 == 0:
+                        logger.info(
+                            f"LLMExtractor: {len(signals)}/{i+1} signals extracted "
+                            f"({i+1}/{n_total} processed)"
+                        )
             except Exception as e:
                 logger.warning(f"LLM extraction failed for row {idx}: {e}")
+            if (i + 1) % 20 == 0:
+                logger.info(f"LLMExtractor: progress {i+1}/{n_total} records")
 
         if not signals:
             logger.info("LLMExtractor: No signals extracted, falling back to synthetic")
@@ -213,24 +230,32 @@ class LLMExtractor(SignalExtractor):
             logger.info("LLMExtractor: Empty signal data, falling back to synthetic")
             return self._extract_synthetic(synth_data)
 
-        signal_array = signal_df[signal_name].values.astype(np.float64)
+        # Pivot to wide format: date index, ticker columns
+        try:
+            signal_df["signal_date"] = pd.to_datetime(signal_df["signal_date"])
+            wide_df = signal_df.pivot_table(
+                index="signal_date",
+                columns="ticker",
+                values=signal_name,
+                aggfunc="first",
+            )
+            wide_df.index = pd.DatetimeIndex(wide_df.index)
+        except Exception:
+            logger.info("LLMExtractor: Failed to pivot signal data, falling back to synthetic")
+            return self._extract_synthetic(synth_data)
 
         return SignalData(
-            values=signal_array,
-            dates=signal_df["signal_date"].tolist(),
-            tickers=signal_df["ticker"].tolist(),
-            signal_name=signal_name,
-            higher_is_better=higher_is_better,
+            df=wide_df,
+            long_format=signal_df.copy(),
             metadata=SignalMetadata(
-                extractor=self.extractor_name,
+                extractor_name=self.extractor_name,
                 extractor_version=self.version,
                 extractor_method="llm",
-                llm_model=self._model,
-                llm_temperature=self._temperature,
-                is_deterministic=(self._temperature == 0.0),
-                extraction_date=datetime.now(timezone.utc).isoformat(),
-                n_signals=len(signal_df),
-                extra={
+                parameters={
+                    "llm_model": self._model,
+                    "llm_temperature": self._temperature,
+                    "is_deterministic": (self._temperature == 0.0),
+                    "n_signals": len(signal_df),
                     "n_api_calls": self._call_count,
                     "est_cost_usd": round(self._total_cost_est, 4),
                 },
@@ -306,11 +331,9 @@ INSTRUCTIONS:
 Read the filing text below and extract the signal value. The signal measures:
 {hypothesis.mechanism}
 
-Return a JSON object with exactly these fields:
-- signal_value: a float between -1.0 (strongest negative signal) and 1.0 (strongest positive signal). Map the linguistic features described in the mechanism to this range.
-- confidence: a float between 0.0 (no evidence in text) and 1.0 (text clearly exhibits the signal), indicating how confidently you can extract this signal from the provided text.
-- features_found: a list of strings naming the specific linguistic features you found.
-- rationale: a one-sentence explanation of the score.
+Return ONLY a JSON object with exactly these two fields and nothing else:
+- signal_value: float between -1.0 and 1.0
+- confidence: float between 0.0 and 1.0
 
 FILING TYPE: {metadata.get('form_type', 'Unknown')}
 TICKER: {metadata.get('ticker', 'Unknown')}
@@ -346,7 +369,7 @@ Return ONLY the JSON object, no other text."""
 
         payload = {
             "model": self._model,
-            "max_tokens": 500,
+            "max_tokens": 800,
             "temperature": self._temperature,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -410,7 +433,6 @@ Return ONLY the JSON object, no other text."""
         if not response:
             return None
 
-        # Try to find JSON object in response
         cleaned = response.strip()
         # Remove markdown code fences if present
         if cleaned.startswith("```"):
@@ -418,23 +440,80 @@ Return ONLY the JSON object, no other text."""
             lines = [l for l in lines if not l.startswith("```")]
             cleaned = "\n".join(lines).strip()
 
+        # Strategy 1: Full parse
         try:
             parsed = json.loads(cleaned)
             if "signal_value" in parsed:
                 return parsed
         except json.JSONDecodeError:
-            # Try to extract JSON from mixed text
+            pass
+
+        # Strategy 2: Brace-matched extraction (handles nested JSON, multi-line)
+        json_obj = self._extract_json_by_braces(cleaned)
+        if json_obj:
+            try:
+                parsed = json.loads(json_obj)
+                if "signal_value" in parsed:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: Fix trailing commas then retry on json_obj or cleaned
+        try:
             import re
-            json_match = re.search(r'\{[^}]+\}', cleaned)
-            if json_match:
-                try:
-                    parsed = json.loads(json_match.group())
-                    if "signal_value" in parsed:
-                        return parsed
-                except json.JSONDecodeError:
-                    pass
+            candidate = json_obj or cleaned
+            fixed = re.sub(r',\s*}', '}', candidate)
+            fixed = re.sub(r',\s*]', ']', fixed)
+            parsed = json.loads(fixed)
+            if "signal_value" in parsed:
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Strategy 4: Regex field extraction (last resort)
+        try:
+            import re
+            sv_match = re.search(r'"signal_value"\s*:\s*(-?[\d.]+)', cleaned)
+            conf_match = re.search(r'"confidence"\s*:\s*(-?[\d.]+)', cleaned)
+            if sv_match:
+                return {
+                    "signal_value": float(sv_match.group(1)),
+                    "confidence": float(conf_match.group(1)) if conf_match else 0.5,
+                }
+        except (ValueError, AttributeError):
+            pass
 
         logger.warning(f"Failed to parse LLM response: {response[:200]}...")
+        return None
+
+    @staticmethod
+    def _extract_json_by_braces(text: str) -> Optional[str]:
+        """Extract a JSON object by counting open/close braces."""
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
         return None
 
     # ------------------------------------------------------------------
@@ -472,6 +551,37 @@ Return ONLY the JSON object, no other text."""
                 return df
         if isinstance(raw_data, pd.DataFrame):
             return raw_data if not raw_data.empty else None
+        return None
+
+    @staticmethod
+    def _filter_relevant_rows(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Filter DataFrame to rows where the most specific text column has content.
+
+        Priority: departure_text > transcript_text > earnings_release_text >
+                  mda_text > risk_factors_text > business_text > full_text.
+
+        Returns None if no rows have usable text.
+        """
+        text_cols_in_order = [
+            "departure_text", "transcript_text",
+            "earnings_release_text", "mda_text",
+            "risk_factors_text", "business_text",
+            "full_text",
+        ]
+        # Find the most specific column that actually exists and has data
+        for col in text_cols_in_order:
+            if col in df.columns:
+                mask = df[col].notna() & (df[col].str.len() > 100)
+                if mask.any():
+                    filtered = df[mask].copy()
+                    n_skipped = len(df) - len(filtered)
+                    if n_skipped > 0:
+                        logger.info(
+                            f"LLMExtractor: Filtering on '{col}' — "
+                            f"keeping {len(filtered)}/{len(df)} records "
+                            f"(skipped {n_skipped} without {col})"
+                        )
+                    return filtered
         return None
 
     def _get_best_text(self, row: pd.Series) -> str:
@@ -558,13 +668,9 @@ Return ONLY the JSON object, no other text."""
 
         # Ultimate fallback: empty signal
         return SignalData(
-            values=np.array([]),
-            dates=[],
-            tickers=[],
-            signal_name=params.get("signal_name", "signal"),
-            higher_is_better=params.get("higher_is_better", False),
+            df=pd.DataFrame(),
             metadata=SignalMetadata(
-                extractor=self.extractor_name,
+                extractor_name=self.extractor_name,
                 extractor_version=self.version,
                 extractor_method="synthetic_fallback",
             ),
@@ -574,18 +680,24 @@ Return ONLY the JSON object, no other text."""
         """Validate extracted signal data."""
         issues: List[str] = []
 
-        if signal_data.values is None or len(signal_data.values) == 0:
+        df = signal_data.df
+        if df is None or df.empty:
             issues.append("No signal values extracted")
             return False, issues
 
-        if len(signal_data.values) < 5:
+        # Count non-NaN signal values (sparse signals are expected for
+        # event-driven data like 8-K departures — each ticker only has
+        # a departure event occasionally).
+        n_non_nan = int((~df.isna()).sum().sum())
+        if n_non_nan < 3:
             issues.append(
-                f"Too few signal values ({len(signal_data.values)}): need >= 5"
+                f"Too few non-NaN signal values ({n_non_nan}): need >= 3"
             )
 
-        n_nan = int(np.isnan(signal_data.values).sum())
-        if n_nan > len(signal_data.values) * 0.5:
-            issues.append(f"Majority of signal values are NaN ({n_nan}/{len(signal_data.values)})")
+        if n_non_nan > 0 and n_non_nan < 5:
+            issues.append(
+                f"Few signal values ({n_non_nan}): statistical power will be limited"
+            )
 
         return len(issues) == 0, issues
 

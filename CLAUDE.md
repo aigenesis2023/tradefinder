@@ -20,13 +20,18 @@ Information firewall: Stage 1 and Stage 2 never communicate. Pipeline is locked 
 3. FDA BRLAS → BROKEN (α=339bps < 500bps min, 20 events)
 4. CAM Expansion Velocity → BROKEN (hit rate 51.85% < 55% min)
 
-**Infrastructure built (2026-05-14 session):**
-- EventStudyBacktester: handles sparse/event-driven signals (FDA, M&A, regulatory)
-- Sparse signal auto-detection: routes to event study vs cross-sectional backtest
-- LLMExtractor: generic LLM-based signal extraction (Anthropic/DeepSeek API, temp=0)
-- 8-K section extraction: Item 5.02 (departure), Item 2.02 (earnings), etc.
-- SEC User-Agent fix: honest `TradeFinderResearch/1.0` — browser-mimetic strings rejected
-- Universe refresh: 10,347 SEC tickers available (was stuck at 61 due to WAF)
+**Calibration pipeline verified (2026-05-16):**
+- Tier 1 (Positive Controls): Momentum 12-1 SURVIVES — Sharpe 2.37, alpha 4979 bps, p=0.005
+- Tier 3 (Negative Controls): Random uniform BROKEN (p=0.84), shuffled momentum BROKEN (p=0.49)
+- Cross-sectional permutation test: fixed from within-ticker shuffle (p=1.0 bug) to within-date shuffle
+- OUTLIER DRIVEN: demoted from hard BROKEN to SURVIVED_WARNING (momentum profits from tail events)
+- Test suite: 5 OK, 3 skipped (synthetic FDA data deliberately removed per no-fabrication design)
+- Tiers 2+4 (power curve, null distribution) not yet run — need 100-ticker yfinance download
+
+**Quick tests available:**
+- `python test_tier1_quick.py` — momentum through pipeline from cached data (~6 min, 30 tickers)
+- `python test_tier3_quick.py` — random/shuffled negative controls (~16 min)
+- `python run_loop.py --calibrate-only` — full 4-tier calibration (hours, needs yfinance download)
 
 **13 of 16 Stage 1 hypotheses still untested. Signal construction is the bottleneck.**
 

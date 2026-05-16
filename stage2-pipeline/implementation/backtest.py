@@ -298,7 +298,7 @@ class TransactionCostCalculator:
 
         # 2. Spread cost
         spread_bps = self.estimate_spread_bps(market_cap) if self.model.use_spread_model else 5.0
-        spread_cost = notional * spread_bps / 10000.0  # Divide by 2 for half-spread per side
+        spread_cost = notional * spread_bps / 10000.0  # Full round-trip spread from estimate_spread_bps()
 
         # 3. Slippage
         slippage_bps = (
@@ -527,6 +527,59 @@ class PositionSizer:
 
 
 # ============================================================================
+# Shared Helpers
+# ============================================================================
+
+
+def _compute_holding_period_return(
+    positions: "pd.DataFrame",
+    price_df: "pd.DataFrame",
+    start_date: str,
+    holding_period_days: int,
+) -> float:
+    """Compute equal-weighted forward return for a cohort of stocks.
+
+    Shared by WalkForwardBacktester and CrossSectionalBacktester.
+    Entry price is the first available price strictly after start_date.
+    Exit price is the last available price at or before end_dt.
+    """
+    if positions.empty or "ticker" not in positions.columns:
+        return 0.0
+
+    start_dt = pd.Timestamp(start_date)
+    end_dt = start_dt + pd.tseries.offsets.BusinessDay(n=holding_period_days)
+
+    cohort_return = 0.0
+    valid_count = 0
+
+    for _, pos in positions.iterrows():
+        ticker = pos["ticker"]
+        if ticker not in price_df.columns:
+            continue
+
+        ticker_prices = price_df[ticker].dropna()
+
+        entry_prices = ticker_prices[ticker_prices.index > start_dt]
+        if entry_prices.empty:
+            continue
+
+        entry_price = entry_prices.iloc[0]
+
+        exit_prices = ticker_prices[ticker_prices.index <= end_dt]
+        if exit_prices.empty or exit_prices.index[-1] <= entry_prices.index[0]:
+            continue
+
+        exit_price = exit_prices.iloc[-1]
+
+        if entry_price > 0:
+            ret = (exit_price / entry_price) - 1.0
+            cohort_return += ret
+            valid_count += 1
+
+    return cohort_return / valid_count if valid_count > 0 else 0.0
+
+
+# ============================================================================
 # Walk-Forward Backtester
 # ============================================================================
 
@@ -639,9 +692,7 @@ class WalkForwardBacktester:
     ) -> BacktestResult:
         """Backtest a single walk-forward window."""
         trades = []
-        daily_positions = []
-        portfolio_value = self.position_sizer.spec.capital
-        portfolio_values = [portfolio_value]
+        portfolio_returns = []
 
         for date in sorted(test_dates):
             # Get signals for this date
@@ -682,6 +733,15 @@ class WalkForwardBacktester:
                 ),
             )
 
+            # Compute forward return for this cohort
+            cohort_ret = _compute_holding_period_return(
+                positions=positions,
+                price_df=price_df,
+                start_date=date,
+                holding_period_days=holding_period_days,
+            )
+            portfolio_returns.append({"date": date, "return": cohort_ret})
+
             # Record trades with costs
             for _, pos in positions.iterrows():
                 cost = self.cost_calculator.calculate_trade_cost(
@@ -711,31 +771,27 @@ class WalkForwardBacktester:
                     "cost_bps": cost.cost_bps,
                 })
 
-            # WalkForwardBacktester forward return computation is not yet
-            # implemented. The pipeline uses CrossSectionalBacktester which
-            # has full forward return logic. To implement: compute holding-
-            # period returns per position using price_df, then aggregate
-            # to portfolio level.
-            raise NotImplementedError(
-                "WalkForwardBacktester forward return computation is not implemented. "
-                "Use CrossSectionalBacktester for production backtests."
-            )
-
         # Compile results
         trades_df = pd.DataFrame(trades)
-        return self._compile_result(trades_df, window_name, test_dates)
+        returns_series = (
+            pd.DataFrame(portfolio_returns).set_index("date")["return"]
+            if portfolio_returns
+            else pd.Series(dtype=float)
+        )
+        return self._compile_result(trades_df, returns_series, window_name, test_dates)
 
     def _compile_result(
         self,
         trades_df: pd.DataFrame,
+        returns_series: pd.Series,
         window_name: str,
         test_dates: List[str],
     ) -> BacktestResult:
-        """Compile a backtest result from trade log."""
-        if trades_df.empty:
+        """Compile a backtest result from trade log and return series."""
+        if trades_df.empty and returns_series.empty:
             return BacktestResult(
-                gross_returns=pd.Series(),
-                net_returns=pd.Series(),
+                gross_returns=pd.Series(dtype=float),
+                net_returns=pd.Series(dtype=float),
                 cost_breakdown=pd.DataFrame(),
                 positions=pd.DataFrame(),
                 trade_log=trades_df,
@@ -760,45 +816,87 @@ class WalkForwardBacktester:
                 warnings=[],
             )
 
-        # Aggregate daily returns
-        trades_df["date"] = pd.to_datetime(trades_df["date"])
-        daily_trades = trades_df.groupby("date").agg({
-            "notional": "sum",
-            "total_cost": "sum",
-        })
-
-        # Placeholder for actual return calculation
-        # In production, this would track the actual trade returns
-        gross_returns = pd.Series(0.0, index=daily_trades.index)
-        net_returns = pd.Series(0.0, index=daily_trades.index)
+        # Aggregate daily trades
+        if not trades_df.empty:
+            trades_df["date"] = pd.to_datetime(trades_df["date"])
+            daily_trades = trades_df.groupby("date").agg({
+                "notional": "sum",
+                "total_cost": "sum",
+            })
+            cost_breakdown = trades_df.groupby("date")[["commission", "spread_cost", "slippage_cost", "borrow_cost"]].sum()
+        else:
+            daily_trades = pd.DataFrame()
+            cost_breakdown = pd.DataFrame()
 
         n_trading_days = len(test_dates)
-        n_years = n_trading_days / 252.0
+        n_obs = len(returns_series)
 
-        total_costs = trades_df["total_cost"].sum()
-        total_notional = trades_df["notional"].sum()
+        # Derive n_years from actual calendar span
+        if n_obs >= 2:
+            try:
+                calendar_days = (returns_series.index[-1] - returns_series.index[0]).days
+                n_years = max(calendar_days / 365.25, 0.01)
+            except (TypeError, AttributeError):
+                n_years = max(n_trading_days / 252.0, 0.01)
+        else:
+            n_years = max(n_trading_days / 252.0, 0.01)
+
+        holding_period_days_est = 21  # default; refined below if possible
+        periods_per_year = max(252.0 / holding_period_days_est, 1.0)
+        ann_vol_factor = np.sqrt(periods_per_year)
+
+        if returns_series.empty:
+            gross_total_return = 0.0
+            gross_ann_return = 0.0
+            gross_ann_vol = 0.0
+            gross_sharpe = 0.0
+            gross_max_dd = 0.0
+        else:
+            gross_total_return = (1 + returns_series).prod() - 1
+            gross_ann_return = (1 + gross_total_return) ** (1 / n_years) - 1 if n_years > 0 else 0.0
+            gross_ann_vol = returns_series.std() * ann_vol_factor
+            gross_sharpe = gross_ann_return / gross_ann_vol if gross_ann_vol > 0 else 0.0
+            cum_returns = (1 + returns_series).cumprod()
+            gross_max_dd = (cum_returns / cum_returns.cummax() - 1).min()
+
+        total_costs = trades_df["total_cost"].sum() if not trades_df.empty else 0.0
+        total_notional = trades_df["notional"].sum() if not trades_df.empty else 0.0
         avg_cost_bps = (total_costs / total_notional * 10000) if total_notional > 0 else 0
 
+        cost_drag_annual_bps = (
+            total_costs / (self.position_sizer.spec.capital * n_years) * 10000
+            if n_years > 0 and self.position_sizer.spec.capital > 0
+            else 0.0
+        )
+
+        net_total_return = gross_total_return - (
+            total_costs / self.position_sizer.spec.capital
+            if self.position_sizer.spec.capital > 0
+            else 0.0
+        )
+        net_ann_return = (1 + net_total_return) ** (1 / n_years) - 1 if n_years > 0 else 0.0
+        net_sharpe = net_ann_return / gross_ann_vol if gross_ann_vol > 0 else 0.0
+
         return BacktestResult(
-            gross_returns=gross_returns,
-            net_returns=net_returns,
-            cost_breakdown=trades_df.groupby("date")[["commission", "spread_cost", "slippage_cost", "borrow_cost"]].sum(),
+            gross_returns=returns_series,
+            net_returns=returns_series - (total_costs / self.position_sizer.spec.capital / max(n_obs, 1)),
+            cost_breakdown=cost_breakdown,
             positions=pd.DataFrame(),
             trade_log=trades_df,
-            gross_total_return=0.0,
-            gross_annualized_return=0.0,
-            gross_annualized_volatility=0.0,
-            gross_sharpe_ratio=0.0,
-            gross_max_drawdown=0.0,
-            net_total_return=0.0,
-            net_annualized_return=0.0,
-            net_annualized_volatility=0.0,
-            net_sharpe_ratio=0.0,
-            net_max_drawdown=0.0,
+            gross_total_return=gross_total_return,
+            gross_annualized_return=gross_ann_return,
+            gross_annualized_volatility=gross_ann_vol,
+            gross_sharpe_ratio=gross_sharpe,
+            gross_max_drawdown=gross_max_dd,
+            net_total_return=net_total_return,
+            net_annualized_return=net_ann_return,
+            net_annualized_volatility=gross_ann_vol,
+            net_sharpe_ratio=net_sharpe,
+            net_max_drawdown=gross_max_dd,
             total_costs_bps=total_costs / self.position_sizer.spec.capital * 10000 if self.position_sizer.spec.capital > 0 else 0,
             average_cost_per_trade_bps=avg_cost_bps,
             annual_turnover=total_notional / (self.position_sizer.spec.capital * n_years) if n_years > 0 else 0,
-            cost_drag_annualized_bps=total_costs / (self.position_sizer.spec.capital * n_years) * 10000 if n_years > 0 and self.position_sizer.spec.capital > 0 else 0,
+            cost_drag_annualized_bps=cost_drag_annual_bps,
             start_date=test_dates[0] if test_dates else "",
             end_date=test_dates[-1] if test_dates else "",
             n_trades=len(trades_df),
@@ -893,15 +991,17 @@ class EventStudyBacktester:
             if ticker not in price_df.columns:
                 continue
 
-            ret = self._compute_event_return(
+            result = self._compute_event_return(
                 ticker=ticker,
                 event_date=event_date,
                 price_df=price_df,
                 holding_period_days=holding_period_days,
             )
 
-            if ret is None:
+            if result is None:
                 continue
+
+            ret, exit_price_from_data = result
 
             # Compute market return for excess return if requested
             market_ret = 0.0
@@ -915,22 +1015,39 @@ class EventStudyBacktester:
 
             excess_ret = ret - market_ret
 
-            # Estimate trade cost for a hypothetical position
+            # Estimate trade costs for entry and exit
             try:
                 entry_date = event["entry_date"]
                 entry_price = event["entry_price"]
             except KeyError:
                 entry_price = 50.0
 
-            cost = self.cost_calculator.calculate_trade_cost(
+            shares = int(self.position_sizer.spec.capital / entry_price) if entry_price > 0 else 100
+
+            entry_cost = self.cost_calculator.calculate_trade_cost(
                 ticker=ticker,
                 side=Side.LONG,
-                shares=int(self.position_sizer.spec.capital / entry_price) if entry_price > 0 else 100,
+                shares=shares,
                 price=entry_price,
                 market_cap=event.get("market_cap", 1e10),
                 adv=event.get("adv", 1e7),
                 holding_period_days=holding_period_days,
             )
+
+            # Exit trade cost (sell-to-close, no borrow cost)
+            exit_cost = self.cost_calculator.calculate_trade_cost(
+                ticker=ticker,
+                side=Side.LONG,
+                shares=shares,
+                price=exit_price_from_data,
+                market_cap=event.get("market_cap", 1e10),
+                adv=event.get("adv", 1e7),
+                holding_period_days=0,  # no holding period for exit
+            )
+
+            total_trade_cost = entry_cost.total_cost + exit_cost.total_cost
+            total_cost_bps = ((entry_cost.cost_bps + exit_cost.cost_bps) / 2.0
+                              if entry_cost.cost_bps and exit_cost.cost_bps else 0)
 
             event_returns.append({
                 "date": event_date,
@@ -940,20 +1057,21 @@ class EventStudyBacktester:
                 "market_return": market_ret,
                 "excess_return": excess_ret,
                 "entry_price": entry_price,
-                "cost_bps": cost.cost_bps,
-                "total_cost": cost.total_cost,
+                "exit_price": exit_price_from_data,
+                "cost_bps": total_cost_bps,
+                "total_cost": total_trade_cost,
             })
 
             trades.append({
                 "date": event_date,
                 "ticker": ticker,
                 "side": "LONG",
-                "shares": int(self.position_sizer.spec.capital / entry_price) if entry_price > 0 else 100,
+                "shares": shares,
                 "price": entry_price,
                 "notional": self.position_sizer.spec.capital,
                 "weight": 1.0,
-                "total_cost": cost.total_cost,
-                "cost_bps": cost.cost_bps,
+                "total_cost": total_trade_cost,
+                "cost_bps": total_cost_bps,
             })
 
         if not event_returns:
@@ -999,11 +1117,14 @@ class EventStudyBacktester:
         event_date: pd.Timestamp,
         price_df: pd.DataFrame,
         holding_period_days: int,
-    ) -> Optional[float]:
+    ) -> Optional[Tuple[float, float]]:
         """Compute the forward holding-period return for a single event.
 
         Entry price: first available price strictly after event_date.
         Exit price: last available price on or before event_date + holding_period_days.
+
+        Returns:
+            (return, exit_price) or None if insufficient price data.
         """
         ticker_prices = price_df[ticker].dropna()
         if ticker_prices.empty:
@@ -1026,7 +1147,7 @@ class EventStudyBacktester:
         if entry_price <= 0:
             return None
 
-        return float((exit_price / entry_price) - 1.0)
+        return float((exit_price / entry_price) - 1.0), float(exit_price)
 
     def _compute_market_return(
         self,
@@ -1263,9 +1384,14 @@ class CrossSectionalBacktester:
             if day_signals.empty:
                 continue
 
-            # Select top quantile
+            # Select top quantile (long leg)
             n_select = max(1, int(len(day_signals) * top_quantile))
             selected = day_signals.nlargest(n_select)
+
+            # Select bottom quantile (short leg) when long_only=False
+            short_selected = None
+            if not long_only:
+                short_selected = day_signals.nsmallest(n_select)
 
             # Get prices for selected stocks
             common_tickers = set(selected.index) & set(price_df.columns)
@@ -1287,7 +1413,8 @@ class CrossSectionalBacktester:
                 sectors=None,
             )
 
-            # Calculate trade costs
+            # Long leg trade costs & forward return
+            long_return = 0.0
             for _, pos in positions.iterrows():
                 cost = self.cost_calculator.calculate_trade_cost(
                     ticker=pos["ticker"],
@@ -1311,16 +1438,63 @@ class CrossSectionalBacktester:
                     "cost_bps": cost.cost_bps,
                 })
 
-            # Compute forward return for this cohort
-            forward_return = self._compute_cohort_return(
+            long_return = self._compute_cohort_return(
                 positions=positions,
                 price_df=price_df,
                 start_date=date,
                 holding_period_days=holding_period_days,
             )
+
+            # Short leg (only when long_only=False)
+            short_return = 0.0
+            if not long_only and short_selected is not None:
+                short_common = set(short_selected.index) & set(price_df.columns)
+                if short_common:
+                    short_selected = short_selected[list(short_common)]
+                    short_positions = self.position_sizer.size_positions(
+                        signals=short_selected,
+                        prices=day_prices,
+                        market_caps=day_mcaps,
+                        advs=day_volumes,
+                        sectors=None,
+                    )
+
+                    for _, pos in short_positions.iterrows():
+                        sc = self.cost_calculator.calculate_trade_cost(
+                            ticker=pos["ticker"],
+                            side=Side.SHORT,
+                            shares=int(pos["shares"]),
+                            price=pos["price"],
+                            market_cap=pos.get("market_cap", 1e9),
+                            adv=pos.get("adv", 1e7),
+                            holding_period_days=holding_period_days,
+                        )
+
+                        trades.append({
+                            "date": date,
+                            "ticker": pos["ticker"],
+                            "side": "SHORT",
+                            "shares": int(pos["shares"]),
+                            "price": pos["price"],
+                            "notional": pos["notional"],
+                            "weight": pos["weight"],
+                            "total_cost": sc.total_cost,
+                            "cost_bps": sc.cost_bps,
+                        })
+
+                    short_return = self._compute_cohort_return(
+                        positions=short_positions,
+                        price_df=price_df,
+                        start_date=date,
+                        holding_period_days=holding_period_days,
+                    )
+
+            # Portfolio return: long - short (short leg returns are positive
+            # when the shorted stocks go down, which is good for the strategy)
+            portfolio_return = long_return - short_return
             portfolio_returns.append({
                 "date": date,
-                "return": forward_return,
+                "return": portfolio_return,
             })
 
         trades_df = pd.DataFrame(trades)
@@ -1346,42 +1520,7 @@ class CrossSectionalBacktester:
         holding_period_days: int,
     ) -> float:
         """Compute equal-weighted forward return for a cohort of stocks."""
-        if positions.empty or "ticker" not in positions.columns:
-            return 0.0
-
-        start_dt = pd.Timestamp(start_date)
-        end_dt = start_dt + pd.tseries.offsets.BusinessDay(n=holding_period_days)
-
-        cohort_return = 0.0
-        valid_count = 0
-
-        for _, pos in positions.iterrows():
-            ticker = pos["ticker"]
-            if ticker not in price_df.columns:
-                continue
-
-            ticker_prices = price_df[ticker].dropna()
-
-            # Entry price
-            entry_prices = ticker_prices[ticker_prices.index > start_dt]
-            if entry_prices.empty:
-                continue
-
-            entry_price = entry_prices.iloc[0]
-
-            # Exit price
-            exit_prices = ticker_prices[ticker_prices.index <= end_dt]
-            if exit_prices.empty or exit_prices.index[-1] <= entry_prices.index[0]:
-                continue
-
-            exit_price = exit_prices.iloc[-1]
-
-            if entry_price > 0:
-                ret = (exit_price / entry_price) - 1.0
-                cohort_return += ret
-                valid_count += 1
-
-        return cohort_return / valid_count if valid_count > 0 else 0.0
+        return _compute_holding_period_return(positions, price_df, start_date, holding_period_days)
 
     def _compile_result(
         self,

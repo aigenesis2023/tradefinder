@@ -12,10 +12,16 @@ if _PARENT not in _sys.path:
 
 from .linguistic import LinguisticExtractor
 from .llm_extractor import LLMExtractor
+from .pronoun_divergence import PronounDivergenceExtractor
+from .risk_factor_removal import RiskFactorRemovalExtractor
+from .cam_expansion import CAMExpansionExtractor
 
 EXTRACTOR_REGISTRY: dict = {
     "linguistic": LinguisticExtractor,
     "llm": LLMExtractor,
+    "pronoun_divergence": PronounDivergenceExtractor,
+    "risk_factor_removal": RiskFactorRemovalExtractor,
+    "cam_expansion": CAMExpansionExtractor,
 }
 
 
@@ -33,6 +39,9 @@ def get_extractor(name: str):
 __all__ = [
     "LinguisticExtractor",
     "LLMExtractor",
+    "PronounDivergenceExtractor",
+    "RiskFactorRemovalExtractor",
+    "CAMExpansionExtractor",
     "EXTRACTOR_REGISTRY",
     "get_extractor",
 ]

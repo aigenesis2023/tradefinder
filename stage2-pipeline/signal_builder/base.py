@@ -192,9 +192,14 @@ class RawData:
 
     def __post_init__(self):
         if not self.content_hash and self.records is not None and not self.records.empty:
-            self.content_hash = hashlib.sha256(
-                self.records.to_csv(index=False).encode()
-            ).hexdigest()[:16]
+            # Hash shape + column names + first 1000 cells (cheap fingerprint
+            # that avoids serialising multi-MB text columns into CSV strings).
+            try:
+                sample = self.records.iloc[:10, :min(100, self.records.shape[1])]
+                payload = f"{self.records.shape}|{list(self.records.columns)}|{sample.to_csv(index=False)}"
+                self.content_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+            except Exception:
+                self.content_hash = ""
 
     def validate(self) -> Tuple[bool, List[str]]:
         """Basic validation: non-empty, has expected columns."""

@@ -291,6 +291,8 @@ class FactorConstructor:
                 "momentum_return": top_return - bottom_return,
             })
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["momentum_return"]
 
     # ------------------------------------------------------------------
@@ -354,6 +356,8 @@ class FactorConstructor:
 
             factor_returns.append({"date": date, "reversal_return": top_ret - bottom_ret})
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["reversal_return"]
 
     # ------------------------------------------------------------------
@@ -429,6 +433,8 @@ class FactorConstructor:
 
             factor_returns.append({"date": date, "pead_return": top_ret - bottom_ret})
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["pead_return"]
 
     # ------------------------------------------------------------------
@@ -488,6 +494,8 @@ class FactorConstructor:
 
             factor_returns.append({"date": date, "value_return": top_ret - bottom_ret})
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["value_return"]
 
     # ------------------------------------------------------------------
@@ -542,6 +550,8 @@ class FactorConstructor:
 
             factor_returns.append({"date": date, "size_return": top_ret - bottom_ret})
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["size_return"]
 
     # ------------------------------------------------------------------
@@ -606,6 +616,8 @@ class FactorConstructor:
 
             factor_returns.append({"date": date, "liquidity_return": top_ret - bottom_ret})
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["liquidity_return"]
 
     # ------------------------------------------------------------------
@@ -659,6 +671,8 @@ class FactorConstructor:
 
             factor_returns.append({"date": date, "lowvol_return": top_ret - bottom_ret})
 
+        if not factor_returns:
+            return pd.Series(dtype=float)
         return pd.DataFrame(factor_returns).set_index("date")["lowvol_return"]
 
     # ------------------------------------------------------------------
@@ -688,6 +702,87 @@ class FactorConstructor:
         sector_neutral = aligned["signal"] - sector_means
 
         return sector_neutral
+
+    # ------------------------------------------------------------------
+    # Sector-Neutral Factor Returns (long/short within each sector)
+    # ------------------------------------------------------------------
+
+    def construct_sector_neutral_momentum_return(
+        self,
+        price_df: pd.DataFrame,
+        universe_dates: List[str],
+        sector_df: pd.DataFrame,
+        top_quantile: float = 0.3,
+        bottom_quantile: float = 0.3,
+    ) -> pd.Series:
+        """Construct sector-neutral momentum factor return series."""
+        factor_returns = []
+        for i, date in enumerate(universe_dates):
+            if i < TRADING_DAYS_PER_MONTH * 12:
+                continue
+            date_idx = price_df.index.get_loc(date)
+            raw_signal = self.construct_momentum_12_1(
+                price_df.iloc[: date_idx + 1], date=date
+            )
+            if raw_signal.empty:
+                continue
+            if date in sector_df.index:
+                raw_signal = self.construct_sector_neutral_factor(
+                    raw_signal, sector_df.loc[date]
+                )
+            if raw_signal.empty:
+                continue
+            n_top = max(1, int(len(raw_signal) * top_quantile))
+            n_bottom = max(1, int(len(raw_signal) * bottom_quantile))
+            top_tickers = raw_signal.nlargest(n_top).index
+            bottom_tickers = raw_signal.nsmallest(n_bottom).index
+            future_idx = date_idx + TRADING_DAYS_PER_MONTH
+            if future_idx >= len(price_df):
+                break
+            top_return = price_df.iloc[future_idx][top_tickers].pct_change().add(1).prod() - 1
+            top_return = top_return.mean() if hasattr(top_return, "mean") else top_return
+            bottom_return = price_df.iloc[future_idx][bottom_tickers].pct_change().add(1).prod() - 1
+            bottom_return = bottom_return.mean() if hasattr(bottom_return, "mean") else bottom_return
+            factor_returns.append({"date": date, "momentum_sn_return": top_return - bottom_return})
+        if not factor_returns:
+            return pd.Series(dtype=float)
+        return pd.DataFrame(factor_returns).set_index("date")["momentum_sn_return"]
+
+    def construct_sector_neutral_reversal_return(
+        self,
+        price_df: pd.DataFrame,
+        universe_dates: List[str],
+        sector_df: pd.DataFrame,
+    ) -> pd.Series:
+        """Construct sector-neutral short-term reversal factor return series."""
+        factor_returns = []
+        for i, date in enumerate(universe_dates):
+            if i < TRADING_DAYS_PER_MONTH:
+                continue
+            date_idx = price_df.index.get_loc(date)
+            raw_signal = self.construct_short_term_reversal(
+                price_df.iloc[: date_idx + 1], date=date
+            )
+            if raw_signal.empty:
+                continue
+            if date in sector_df.index:
+                raw_signal = self.construct_sector_neutral_factor(
+                    raw_signal, sector_df.loc[date]
+                )
+            if raw_signal.empty:
+                continue
+            n = max(1, int(len(raw_signal) * 0.3))
+            top = raw_signal.nlargest(n).index
+            bottom = raw_signal.nsmallest(n).index
+            future_idx = min(date_idx + TRADING_DAYS_PER_MONTH, len(price_df) - 1)
+            top_ret = price_df.iloc[future_idx][top].pct_change().add(1).prod() - 1
+            top_ret = top_ret.mean() if hasattr(top_ret, "mean") else top_ret
+            bottom_ret = price_df.iloc[future_idx][bottom].pct_change().add(1).prod() - 1
+            bottom_ret = bottom_ret.mean() if hasattr(bottom_ret, "mean") else bottom_ret
+            factor_returns.append({"date": date, "reversal_sn_return": top_ret - bottom_ret})
+        if not factor_returns:
+            return pd.Series(dtype=float)
+        return pd.DataFrame(factor_returns).set_index("date")["reversal_sn_return"]
 
     # ------------------------------------------------------------------
     # All Factors Construction
@@ -767,6 +862,28 @@ class FactorConstructor:
             factor_returns["low_volatility"] = lowvol
         except Exception as e:
             logger.warning(f"Failed to construct low vol factor: {e}")
+
+        # 8-9. Sector-neutral variants (momentum + reversal)
+        if sector_df is not None and not sector_df.empty:
+            try:
+                mom_sn = self.construct_sector_neutral_momentum_return(
+                    price_df, universe_dates, sector_df
+                )
+                if not mom_sn.empty:
+                    factor_returns["momentum_12_1_sn"] = mom_sn
+                    logger.info(f"Constructed sector-neutral momentum: {len(mom_sn)} obs")
+            except Exception as e:
+                logger.warning(f"Failed to construct sector-neutral momentum: {e}")
+
+            try:
+                rev_sn = self.construct_sector_neutral_reversal_return(
+                    price_df, universe_dates, sector_df
+                )
+                if not rev_sn.empty:
+                    factor_returns["short_term_reversal_sn"] = rev_sn
+                    logger.info(f"Constructed sector-neutral reversal: {len(rev_sn)} obs")
+            except Exception as e:
+                logger.warning(f"Failed to construct sector-neutral reversal: {e}")
 
         return factor_returns
 

@@ -827,3 +827,210 @@ class ContaminationDetector:
         with open(path, "r") as f:
             data = json.load(f)
         return ContaminationReport.from_dict(data)
+
+
+# ============================================================================
+# Memorization Probe — LLM Price Recall Testing
+# ============================================================================
+
+
+@dataclass
+class MemorizationProbeResult:
+    """Result of testing whether an LLM has memorised historical prices."""
+
+    status: str  # RUN | NOT_RUN | NO_PRICE_DATA
+    n_tickers_tested: int = 0
+    n_dates_per_ticker: int = 5
+    pre_cutoff_mape_pct: Optional[float] = None   # Mean abs % error, pre-cutoff
+    post_cutoff_mape_pct: Optional[float] = None  # Mean abs % error, post-cutoff
+    pre_cutoff_n: int = 0
+    post_cutoff_n: int = 0
+    alpha_decay_pp: Optional[float] = None         # post - pre MAPE (positive = worse post)
+    memorization_detected: bool = False
+    memorization_threshold_pp: float = 15.0        # >15pp decay = memorization
+    ticker_results: List[Dict[str, Any]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class MemorizationProbe:
+    """Test whether an LLM has memorised historical price data.
+
+    The Look-Ahead-Bench (2026) approach: query the LLM for closing prices
+    on dates both before and after its knowledge cutoff. If pre-cutoff recall
+    is significantly more accurate than post-cutoff (alpha_decay > 15pp),
+    the model is likely recalling prices from training data rather than
+    analysing text.
+
+    Usage:
+        probe = MemorizationProbe(knowledge_cutoff_date="2023-10-01")
+        result = probe.run(
+            price_df=price_data,
+            tickers=["AAPL", "MSFT", "GOOGL"],
+            llm_query_fn=my_llm_query_function,
+        )
+        if result.memorization_detected:
+            logger.warning("LLM shows price memorisation — signals may be contaminated")
+    """
+
+    def __init__(
+        self,
+        knowledge_cutoff_date: str = DEFAULT_KNOWLEDGE_CUTOFF,
+        seed: int = 42,
+    ):
+        try:
+            self._cutoff_ts = pd.Timestamp(knowledge_cutoff_date)
+        except Exception:
+            self._cutoff_ts = pd.Timestamp(DEFAULT_KNOWLEDGE_CUTOFF)
+        self.knowledge_cutoff_date = str(self._cutoff_ts.date())
+        self._rng = random.Random(seed)
+
+    def run(
+        self,
+        price_df: pd.DataFrame,
+        tickers: Optional[List[str]] = None,
+        llm_query_fn: Optional[Callable] = None,
+        n_tickers: int = 20,
+        n_dates: int = 5,
+    ) -> MemorizationProbeResult:
+        """Run the memorisation probe.
+
+        Args:
+            price_df: date-indexed DataFrame with ticker columns containing closing prices.
+            tickers: Tickers to test. If None, samples randomly from price_df columns.
+            llm_query_fn: Callable (ticker, date_str) -> Optional[float] that queries the
+                          LLM for a closing price. If None, returns NOT_RUN.
+            n_tickers: Number of tickers to sample (if tickers not provided).
+            n_dates: Number of dates to test per ticker (split pre/post cutoff).
+
+        Returns:
+            MemorizationProbeResult
+        """
+        if llm_query_fn is None:
+            return MemorizationProbeResult(
+                status="NOT_RUN",
+                warnings=["No LLM query function provided. Cannot test memorisation."],
+            )
+
+        if price_df is None or price_df.empty:
+            return MemorizationProbeResult(
+                status="NO_PRICE_DATA",
+                warnings=["No price data available for memorisation probe."],
+            )
+
+        # Sample tickers
+        available_tickers = [t for t in price_df.columns if not price_df[t].dropna().empty]
+        if tickers is None:
+            if len(available_tickers) > n_tickers:
+                tickers = self._rng.sample(available_tickers, n_tickers)
+            else:
+                tickers = available_tickers[:n_tickers]
+
+        if not tickers:
+            return MemorizationProbeResult(
+                status="NO_PRICE_DATA",
+                warnings=["No tickers with price data found."],
+            )
+
+        # Build date pool: dates available across tickers
+        date_index = pd.to_datetime(price_df.index)
+        pre_dates_all = date_index[date_index < self._cutoff_ts]
+        post_dates_all = date_index[date_index >= self._cutoff_ts]
+
+        pre_errors = []
+        post_errors = []
+        ticker_results = []
+        warnings = []
+
+        for ticker in tickers:
+            ticker_prices = price_df[ticker].dropna()
+            if ticker_prices.empty:
+                continue
+
+            # Pick pre-cutoff dates
+            pre_candidates = [d for d in pre_dates_all if d in ticker_prices.index]
+            pre_sample = self._rng.sample(
+                pre_candidates, min(n_dates // 2 + 1, len(pre_candidates))
+            ) if pre_candidates else []
+
+            # Pick post-cutoff dates
+            post_candidates = [d for d in post_dates_all if d in ticker_prices.index]
+            post_sample = self._rng.sample(
+                post_candidates, min(n_dates // 2 + 1, len(post_candidates))
+            ) if post_candidates else []
+
+            for d in pre_sample:
+                actual = float(ticker_prices.loc[d])
+                try:
+                    predicted = llm_query_fn(ticker, str(d.date()))
+                except Exception as e:
+                    logger.debug(f"LLM query failed for {ticker} on {d.date()}: {e}")
+                    continue
+                if predicted is not None and actual > 0:
+                    ape = abs(predicted - actual) / actual * 100.0
+                    pre_errors.append(ape)
+                    ticker_results.append({
+                        "ticker": ticker, "date": str(d.date()),
+                        "actual": actual, "predicted": predicted,
+                        "ape_pct": ape, "period": "pre_cutoff",
+                    })
+
+            for d in post_sample:
+                actual = float(ticker_prices.loc[d])
+                try:
+                    predicted = llm_query_fn(ticker, str(d.date()))
+                except Exception as e:
+                    logger.debug(f"LLM query failed for {ticker} on {d.date()}: {e}")
+                    continue
+                if predicted is not None and actual > 0:
+                    ape = abs(predicted - actual) / actual * 100.0
+                    post_errors.append(ape)
+                    ticker_results.append({
+                        "ticker": ticker, "date": str(d.date()),
+                        "actual": actual, "predicted": predicted,
+                        "ape_pct": ape, "period": "post_cutoff",
+                    })
+
+        pre_mape = float(np.mean(pre_errors)) if pre_errors else None
+        post_mape = float(np.mean(post_errors)) if post_errors else None
+
+        alpha_decay = None
+        memorization_detected = False
+        if pre_mape is not None and post_mape is not None:
+            # alpha_decay = post_error - pre_error
+            # Positive = worse post-cutoff (good — the model is NOT memorising)
+            # Negative = better pre-cutoff (bad — the model remembers training data)
+            # Actually: higher error = worse. So decay = pre_mape - post_mape
+            #   If pre_mape is very low (good recall before cutoff) and
+            #   post_mape is very high (bad recall after cutoff),
+            #   then decay = low - high = negative (large negative = memorisation)
+            alpha_decay = pre_mape - post_mape
+            # Memorisation: pre-cutoff accuracy is much BETTER than post-cutoff
+            # which means pre_mape << post_mape, so alpha_decay is very negative.
+            memorization_detected = alpha_decay < -self.memorization_threshold_pp
+
+        if memorization_detected:
+            warnings.append(
+                f"MEMORISATION DETECTED: Pre-cutoff recall error ({pre_mape:.1f}%) "
+                f"is substantially lower than post-cutoff ({post_mape:.1f}%). "
+                f"Alpha decay = {alpha_decay:.1f}pp (threshold: {-self.memorization_threshold_pp}pp). "
+                f"The LLM appears to recall prices from its training data. "
+                f"Signals extracted using this model may be contaminated."
+            )
+
+        return MemorizationProbeResult(
+            status="RUN",
+            n_tickers_tested=len(ticker_results) // max(n_dates, 1),
+            n_dates_per_ticker=n_dates,
+            pre_cutoff_mape_pct=pre_mape,
+            post_cutoff_mape_pct=post_mape,
+            pre_cutoff_n=len(pre_errors),
+            post_cutoff_n=len(post_errors),
+            alpha_decay_pp=alpha_decay,
+            memorization_detected=memorization_detected,
+            memorization_threshold_pp=self.memorization_threshold_pp,
+            ticker_results=ticker_results[:50],
+            warnings=warnings,
+        )

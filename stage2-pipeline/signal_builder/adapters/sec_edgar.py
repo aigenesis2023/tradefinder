@@ -70,10 +70,14 @@ SEC_USER_AGENT = _SEC_UA if _SEC_UA else _SEC_ORG_UA
 SEC_RATE_LIMIT_DELAY = 1.0  # seconds between requests
 
 # Maximum number of filings to download per ticker per query.
-# Set to 4 (last year of quarterly filings) to keep single-threaded
-# runs practical. For production: use parallel downloads or pre-built
-# filing database. SEC filing text is 1-30MB each, download-bound.
-MAX_FILINGS_PER_TICKER = 4
+# Set to 6 (1.5 years of quarterly data + annual reports). For cached runs
+# (95%+ cache hit rate from pre-cached files), processing is near-instant.
+# For first runs: 10-K HTML parsing takes ~30-120s per filing (10-30MB).
+# Use precache_filings.py to pre-build the cache for bulk testing.
+MAX_FILINGS_PER_TICKER = 6
+# 8-K filings are much smaller (10-200KB vs 500KB-30MB for 10-Ks),
+# so we can download more of them per ticker.
+MAX_FILINGS_PER_TICKER_8K = 30
 
 
 class SECEdgarAdapter(DataAdapter):
@@ -369,8 +373,12 @@ class SECEdgarAdapter(DataAdapter):
         filings = []
         downloaded = 0
 
+        # 8-Ks are much smaller/faster — use a higher per-ticker cap
+        _is_8k_only = form_set == {"8-K"}
+        _max_per_ticker = MAX_FILINGS_PER_TICKER_8K if _is_8k_only else MAX_FILINGS_PER_TICKER
+
         for i, acc in enumerate(accession_numbers):
-            if downloaded >= MAX_FILINGS_PER_TICKER:
+            if downloaded >= _max_per_ticker:
                 break
 
             form = (form_list[i] if i < len(form_list) else "").upper()
@@ -398,6 +406,12 @@ class SECEdgarAdapter(DataAdapter):
             # Extract sections from clean text (no double parse)
             sections = self._extract_filing_sections_from_clean(clean_text, form)
 
+            # Extract transcript from raw filing text (before HTML stripping,
+            # since we need SEC document markup tags)
+            transcript = None
+            if filing_text and form == "8-K":
+                transcript = self._extract_transcript_if_present(filing_text)
+
             filings.append({
                 "cik": cik_stripped,
                 "ticker": ticker.upper(),
@@ -410,9 +424,14 @@ class SECEdgarAdapter(DataAdapter):
                 "risk_factors_text": sections.get("risk_factors", ""),
                 "mda_text": sections.get("mda", ""),
                 "business_text": sections.get("business", ""),
+                "audit_report_text": sections.get("audit_report", ""),
+                "cam_text": sections.get("cam", ""),
                 "departure_text": sections.get("departure", ""),
                 "earnings_release_text": sections.get("earnings_release", ""),
                 "material_agreement_text": sections.get("material_agreement", ""),
+                "transcript_text": transcript.get("full_transcript", "") if transcript else "",
+                "qa_section": transcript.get("qa_section", "") if transcript else "",
+                "has_qa": bool(transcript and transcript.get("has_qa")),
                 "n_chars": len(clean_text),
             })
 
@@ -630,7 +649,7 @@ class SECEdgarAdapter(DataAdapter):
             re.IGNORECASE,
         ),
         "mda": re.compile(
-            r"(?:ITEM|Item)\s*7[\.\s]\s*Management(?:'s|’s)?\s*Discussion",
+            r"(?:ITEM|Item)\s*7[\.\s]\s*Management(?:’s|’s)?\s*Discussion",
             re.IGNORECASE,
         ),
         "business": re.compile(
@@ -643,6 +662,16 @@ class SECEdgarAdapter(DataAdapter):
         ),
         "legal_proceedings": re.compile(
             r"(?:ITEM|Item)\s*3[\.\s]\s*Legal\s*Proceedings",
+            re.IGNORECASE,
+        ),
+        "audit_report": re.compile(
+            r"(?:REPORT\s+OF\s+INDEPENDENT\s+REGISTERED\s+PUBLIC\s+ACCOUNTING\s+FIRM)"
+            r"|(?:Report\s+of\s+Independent\s+Registered\s+Public\s+Accounting\s+Firm)",
+            re.IGNORECASE,
+        ),
+        "cam": re.compile(
+            r"(?:Critical\s+Audit\s+Matters?)"
+            r"|(?:(?:The\s+)?(?:critical|Critical)\s+audit\s+matters?\s+(?:communicated|identified|are))",
             re.IGNORECASE,
         ),
     }
@@ -752,6 +781,38 @@ class SECEdgarAdapter(DataAdapter):
             sections["full_text"] = clean_text
 
         return sections
+
+    # ------------------------------------------------------------------
+    # Transcript extraction
+    # ------------------------------------------------------------------
+
+    _transcript_extractor = None
+    _transcript_extractor_failed = False
+
+    @classmethod
+    def _extract_transcript_if_present(cls, raw_filing_text: str) -> Optional[Dict[str, Any]]:
+        """Extract earnings call transcript from raw SEC submission text.
+
+        Operates on the raw .txt submission (BEFORE HTML stripping) because
+        it needs SEC document markup tags (DOCUMENT, TYPE, TEXT, etc.).
+        """
+        if cls._transcript_extractor_failed:
+            return None
+        if cls._transcript_extractor is None:
+            try:
+                from signal_builder.extractors.transcript_extractor import (
+                    TranscriptExtractor,
+                )
+                cls._transcript_extractor = TranscriptExtractor()
+            except Exception as e:
+                logger.warning(f"TranscriptExtractor not available: {e}")
+                cls._transcript_extractor_failed = True
+                return None
+        try:
+            return cls._transcript_extractor.extract_from_submission(raw_filing_text)
+        except Exception as e:
+            logger.debug(f"Transcript extraction failed: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Tickerless search

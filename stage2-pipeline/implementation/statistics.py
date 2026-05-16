@@ -205,8 +205,9 @@ class StatisticalReport:
     multiple_comparison: Optional[MultipleComparisonResult]
     outlier_analysis: OutlierAnalysis
     power_analysis: PowerAnalysis
-    warnings: List[str]
-    is_statistically_significant: bool  # After all corrections
+    gt_score_result: Optional[Any] = None  # GTScoreResult from gt_score.py
+    warnings: List[str] = field(default_factory=list)
+    is_statistically_significant: bool = False  # After all corrections
 
 
 # ============================================================================
@@ -1225,7 +1226,17 @@ class StatisticalReportGenerator:
                 f"Minimum detectable effect: d={power_result.minimum_detectable_effect:.3f}."
             )
 
-        # 6. Overall significance determination
+        # 6. GT-Score (Golden Ticket Score) — composite objective function
+        gt_score_result = None
+        try:
+            from gt_score import compute_gt_score_from_series
+            gt_score_result = compute_gt_score_from_series(returns)
+        except ImportError:
+            logger.debug("gt_score module not available, skipping GT-Score")
+        except Exception as e:
+            logger.warning(f"GT-Score computation failed: {e}")
+
+        # 7. Overall significance determination
         # Significant if mean is statistically different from zero
         # (using bootstrap CI rather than t-test, to handle non-normality)
         ci_lower, ci_upper = dist.ci_95_mean
@@ -1243,6 +1254,7 @@ class StatisticalReportGenerator:
             multiple_comparison=mc_result,
             outlier_analysis=outlier_result,
             power_analysis=power_result,
+            gt_score_result=gt_score_result,
             warnings=warnings_list,
             is_statistically_significant=is_significant,
         )

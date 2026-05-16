@@ -45,7 +45,7 @@ _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _IMPL = os.path.join(_PARENT, "implementation")
 _SIGNAL = os.path.join(_PARENT, "signal_builder")
 
-for d in [_IMPL, _SIGNAL, _PARENT]:
+for d in [_IMPL, _PARENT]:
     if d not in sys.path:
         sys.path.insert(0, d)
 
@@ -179,129 +179,13 @@ class TestFDABRLASSignalBuilder(unittest.TestCase):
         self.assertEqual(len(issues), 0, f"Validation issues: {issues}")
         print(f"  [PASS] Hypothesis loaded and validated: {hyp.name} ({hyp.uuid})")
 
+    @unittest.skip("FDAAdapter no longer generates synthetic data (no-fabrication design)")
     def test_03_fda_adapter_synthetic(self):
         """Test FDA adapter with synthetic data generation."""
-        from signal_builder.adapters.fda import FDAAdapter
-        from signal_builder.base import DataSourceSpec
 
-        adapter = FDAAdapter(use_synthetic=True)
-
-        spec = DataSourceSpec(
-            source_type="fda_document",
-            provider="fda",
-            frequency="as_filed",
-            fields=["benefit_section_text", "risk_section_text", "decision"],
-            start_date="2017-01-01",
-            end_date="2025-12-31",
-        )
-
-        raw_data = adapter.acquire(spec)
-        self.assertIsNotNone(raw_data)
-        self.assertFalse(raw_data.records.empty)
-
-        df = raw_data.records
-        print(f"  [PASS] FDA adapter produced {len(df)} records")
-        print(f"         Columns: {list(df.columns)}")
-        print(f"         Synthetic: {raw_data.metadata.get('synthetic', False)}")
-        print(f"         High-BRLAS CRL rate: {raw_data.metadata.get('synthetic_high_brlas_crl_rate', 'N/A'):.2%}")
-        print(f"         Low-BRLAS CRL rate: {raw_data.metadata.get('synthetic_low_brlas_crl_rate', 'N/A'):.2%}")
-
-        # Validate data
-        valid, issues = adapter.validate(raw_data)
-        self.assertTrue(valid, f"Validation issues: {issues}")
-
-        # Check that benefit and risk text sections are present
-        self.assertIn("benefit_section_text", df.columns)
-        self.assertIn("risk_section_text", df.columns)
-        self.assertIn("decision", df.columns)
-
-        # Check that decisions are valid
-        decisions = set(df["decision"].unique())
-        expected_decisions = {"APPROVED", "CRL"}
-        self.assertTrue(expected_decisions.issubset(decisions),
-                        f"Expected decisions {expected_decisions}, got {decisions}")
-
-        # Check that the BRLAS signal flags exist
-        self.assertIn("true_brlas_flag", df.columns)
-
+    @unittest.skip("FDAAdapter no longer generates synthetic data (no-fabrication design)")
     def test_04_linguistic_extractor(self):
         """Test linguistic feature extraction from FDA text."""
-        from signal_builder.adapters.fda import FDAAdapter
-        from signal_builder.extractors.linguistic import LinguisticExtractor
-        from signal_builder.base import DataSourceSpec
-
-        # Get raw data
-        adapter = FDAAdapter(use_synthetic=True)
-        spec = DataSourceSpec(
-            source_type="fda_document",
-            provider="fda",
-            frequency="as_filed",
-            fields=["benefit_section_text", "risk_section_text", "decision"],
-            start_date="2017-01-01",
-            end_date="2025-12-31",
-        )
-        raw_data = adapter.acquire(spec)
-
-        # Extract linguistic features
-        extractor = LinguisticExtractor()
-        signal_data = extractor.extract(
-            raw_data,
-            params={
-                "text_columns": {
-                    "benefit_section_text": "benefit",
-                    "risk_section_text": "risk",
-                },
-                "composite": "brlas",
-                "signal_column": "composite_score",
-                "date_column": "pdufa_date",
-                "id_column": "drug_name",
-                "hypothesis_uuid": "test-fda-brlas-001",
-                "hypothesis_name": "FDA BRLAS Test",
-            },
-        )
-
-        # Check signal DataFrame
-        self.assertIsNotNone(signal_data.df)
-        self.assertFalse(signal_data.df.empty)
-
-        df = signal_data.df
-        print(f"  [PASS] Linguistic extractor produced {df.shape[0]} dates x {df.shape[1]} IDs")
-        print(f"         Index type: {type(df.index)}")
-        print(f"         Signal name: {signal_data.metadata.hypothesis_name}")
-
-        # Check long format features
-        if signal_data.long_format is not None:
-            long_df = signal_data.long_format
-            print(f"         Long format: {len(long_df)} rows")
-
-            # Check for BRLAS-related features
-            feature_cols = [c for c in long_df.columns if any(
-                term in c.lower() for term in
-                ["hedge", "certainty", "composite", "benefit_", "risk_"]
-            )]
-            print(f"         Linguistic features: {len(feature_cols)} columns")
-            self.assertGreater(len(feature_cols), 0, "No linguistic features found")
-
-            # Verify that the composite score column exists
-            self.assertIn("composite_score", long_df.columns)
-
-            # Check that benefit hedged text has higher hedging density than unhedged
-            # The synthetic data embeds this: high-BRLAS drugs have hedged benefits
-            if "benefit_hedge_density" in long_df.columns and "risk_hedge_density" in long_df.columns:
-                avg_benefit_hd = long_df["benefit_hedge_density"].mean()
-                avg_risk_hd = long_df["risk_hedge_density"].mean()
-                print(f"         Avg benefit hedge density: {avg_benefit_hd:.3f}")
-                print(f"         Avg risk hedge density: {avg_risk_hd:.3f}")
-
-            if "benefit_certainty_density" in long_df.columns and "risk_certainty_density" in long_df.columns:
-                avg_benefit_cd = long_df["benefit_certainty_density"].mean()
-                avg_risk_cd = long_df["risk_certainty_density"].mean()
-                print(f"         Avg benefit certainty density: {avg_benefit_cd:.3f}")
-                print(f"         Avg risk certainty density: {avg_risk_cd:.3f}")
-
-        # Validate signal
-        valid, issues = extractor.validate_signal(signal_data)
-        self.assertTrue(valid, f"Signal validation issues: {issues}")
 
     def test_05_signal_builder_full(self):
         """Test the full SignalBuilder orchestrator."""
@@ -338,83 +222,9 @@ class TestFDABRLASSignalBuilder(unittest.TestCase):
         print(f"         Metadata keys: {list(metadata.keys())}")
         print(f"         Extractor: {metadata.get('extractor_name')} v{metadata.get('extractor_version')}")
 
+    @unittest.skip("FDAAdapter no longer generates synthetic data (no-fabrication design)")
     def test_06_signal_predictive_power(self):
-        """Verify that the BRLAS signal has predictive power on synthetic data.
-
-        This is a sanity check: with known linguistic patterns embedded in
-        synthetic data, the extracted signal should separate high-CRL from
-        low-CRL drugs.
-        """
-        from signal_builder.adapters.fda import FDAAdapter
-        from signal_builder.extractors.linguistic import LinguisticExtractor
-        from signal_builder.base import DataSourceSpec
-
-        # Get raw data
-        adapter = FDAAdapter(use_synthetic=True)
-        spec = DataSourceSpec(
-            source_type="fda_document",
-            provider="fda",
-            frequency="as_filed",
-            fields=["benefit_section_text", "risk_section_text", "decision"],
-            start_date="2017-01-01",
-            end_date="2025-12-31",
-        )
-        raw_data = adapter.acquire(spec)
-
-        # Extract features
-        extractor = LinguisticExtractor()
-        signal_data = extractor.extract(
-            raw_data,
-            params={
-                "text_columns": {
-                    "benefit_section_text": "benefit",
-                    "risk_section_text": "risk",
-                },
-                "composite": "brlas",
-            },
-        )
-
-        long_df = signal_data.long_format
-        self.assertIsNotNone(long_df, "Long format DataFrame is None")
-
-        # Merge decisions from original data
-        if "decision" in long_df.columns and "composite_score" in long_df.columns:
-            df = long_df.dropna(subset=["composite_score", "decision"])
-
-            crl_mask = df["decision"] == "CRL"
-            approved_mask = df["decision"] == "APPROVED"
-
-            avg_crl = df.loc[crl_mask, "composite_score"].mean()
-            avg_approved = df.loc[approved_mask, "composite_score"].mean()
-
-            print(f"  [PASS] BRLAS signal predictive analysis:")
-            print(f"         CRL drugs avg BRLAS:     {avg_crl:.4f}")
-            print(f"         Approved drugs avg BRLAS: {avg_approved:.4f}")
-            print(f"         Difference (CRL - Approved): {avg_crl - avg_approved:.4f}")
-
-            # High BRLAS should indicate higher CRL risk
-            # In the synthetic data, we embedded this pattern
-            if avg_crl > avg_approved:
-                print(f"         BRLAS correctly identifies higher CRL risk")
-            else:
-                print(f"         NOTE: BRLAS direction unexpected on synthetic data")
-
-            # Check top-quartile BRLAS CRL rate
-            threshold = df["composite_score"].quantile(0.75)
-            top_quartile = df[df["composite_score"] >= threshold]
-            top_quartile_crl_rate = (top_quartile["decision"] == "CRL").mean()
-            overall_crl_rate = (df["decision"] == "CRL").mean()
-
-            print(f"         Overall CRL rate:     {overall_crl_rate:.2%}")
-            print(f"         Top-quartile BRLAS CRL rate: {top_quartile_crl_rate:.2%}")
-            print(f"         Lift factor:         {top_quartile_crl_rate / max(overall_crl_rate, 0.001):.1f}x")
-
-            # The lift should be > 1.0 if BRLAS has predictive power
-            self.assertGreater(
-                top_quartile_crl_rate / max(overall_crl_rate, 0.001),
-                1.0,
-                "BRLAS signal shows no predictive power (lift <= 1.0)"
-            )
+        """Verify that the BRLAS signal has predictive power on synthetic data."""
 
     def test_07_full_loop(self):
         """Run the full loop: signal_builder -> pipeline -> verdict.

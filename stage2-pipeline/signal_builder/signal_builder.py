@@ -515,9 +515,21 @@ class SignalBuilder:
         signal_name = (hypothesis.signal.signal_name or "").lower()
         hypothesis_name = (hypothesis.name or "").lower()
 
+        # Hypothesis-specific signals that have dedicated extractors
+        dedicated_patterns = {
+            "pronoun": "pronoun_divergence",
+            "risk_factor_removal": "risk_factor_removal",
+            "risk_factor_clean": "risk_factor_removal",
+            "cam_expansion": "cam_expansion",
+            "cam_velocity": "cam_expansion",
+        }
+        for pattern, extractor in dedicated_patterns.items():
+            if pattern in signal_name or pattern in hypothesis_name:
+                return extractor
+
         # Hypothesis-specific signals that need LLM semantic understanding
         llm_signal_patterns = [
-            "departure", "severity", "pronoun", "credibility",
+            "departure", "severity", "credibility",
             "echo", "coherence", "fragility", "scripted",
             "semantic", "pivot", "sentiment_trajectory",
             "cam_expansion", "cam_velocity",
